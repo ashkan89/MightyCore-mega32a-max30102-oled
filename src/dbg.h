@@ -19,12 +19,17 @@
 /* Why a crossing was accepted or thrown away, reported per beat. */
 enum { BEAT_OK = 0, BEAT_SHORT, BEAT_LONG, BEAT_ACQ, BEAT_CONT, BEAT_AMP };
 
+/* What the start-up channel probe concluded.  REVERSED is acted on, not just
+ * reported: the driver's word order is corrected for the rest of the run. */
+enum { PROBE_OK = 0, PROBE_REVERSED, PROBE_NORED, PROBE_NOIR, PROBE_BOTH };
+
 #if DBG_UART
 
 void dbg_init(void);
 void dbg_beat(uint16_t ibi_ms, uint16_t amp, uint8_t code);
 void dbg_loop(void);         /* once per main-loop pass, for the rate figure */
 void dbg_service(void);      /* emits one line per second, from the main loop */
+uint8_t dbg_channel_probe(void);/* one-shot: which FIFO word follows which LED */
 
 #else
 static inline void dbg_init(void)    { }
@@ -32,6 +37,7 @@ static inline void dbg_beat(uint16_t i, uint16_t a, uint8_t c)
 { (void)i; (void)a; (void)c; }
 static inline void dbg_loop(void)    { }
 static inline void dbg_service(void) { }
+static inline uint8_t dbg_channel_probe(void) { return PROBE_OK; }
 #endif
 
 #endif

@@ -57,6 +57,11 @@ uint8_t  max30102_fifo_count(void);    /* MAX_FIFO_ERR on a bus failure  */
 uint16_t max30102_errors(void);        /* consecutive I2C failures       */
 uint8_t  max30102_take_ovf(void);      /* samples lost to FIFO overflow  */
 uint8_t  max30102_read(max_sample_cb cb, uint8_t max_samples);  /* n consumed */
+
+/* FIFO word order, discovered at start-up rather than assumed.  ir_first=1
+ * means this part returns IR before RED, the reverse of the datasheet. */
+void     max30102_set_word_order(uint8_t ir_first);
+uint8_t  max30102_ir_first(void);
 void     max30102_set_leds(uint8_t red_pa, uint8_t ir_pa);
 void     max30102_set_avg(uint8_t avg_code);     /* 0..5 -> 1,2,4,8,16,32 */
 void     max30102_shutdown(uint8_t on);

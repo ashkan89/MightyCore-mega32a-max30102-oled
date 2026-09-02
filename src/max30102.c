@@ -46,6 +46,20 @@ static uint16_t s_err;
 static uint8_t  s_ovf;
 static uint8_t  s_avg_code = 2;
 
+/* Which 3-byte word of each FIFO sample is which emitter.  0 = the datasheet's
+ * SpO2-mode order, RED first then IR, which is what every genuine MAX30102
+ * does and what this driver defaults to.  Parts that disagree -- relabelled
+ * dies, clone silicon, anything whose PART_ID is not 0x15 -- hand back the
+ * pair the other way round, and because the DSP divides one channel by the
+ * other, that inverts the ratio-of-ratios into 1/R.  R then sits permanently
+ * off the end of the SpO2 curve, which is indistinguishable from the sensor
+ * simply refusing to read.  dbg_channel_probe() settles it against the
+ * hardware at start-up and sets this. */
+static uint8_t  s_ir_first;
+
+void max30102_set_word_order(uint8_t ir_first) { s_ir_first = ir_first ? 1 : 0; }
+uint8_t max30102_ir_first(void) { return s_ir_first; }
+
 uint8_t  max30102_present(void)  { return s_present; }
 uint8_t  max30102_part_id(void)  { return s_part;    }
 uint8_t  max30102_rev_id(void)   { return s_rev;     }
@@ -374,11 +388,13 @@ uint8_t max30102_read(max_sample_cb cb, uint8_t max_samples)
 
     for (i = 0; i < n; i++) {
         const uint8_t *p = &b[i * 6];
-        uint32_t red = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-        uint32_t ir  = ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 8) | p[5];
-        red &= 0x03FFFFUL;                     /* 18-bit, as tempLong & 0x3FFFF */
-        ir  &= 0x03FFFFUL;
-        if (cb) cb(red, ir);
+        uint32_t w0 = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+        uint32_t w1 = ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 8) | p[5];
+        w0 &= 0x03FFFFUL;                      /* 18-bit, as tempLong & 0x3FFFF */
+        w1 &= 0x03FFFFUL;
+        /* Which word is which is settled by dbg_channel_probe() against the
+         * hardware, not assumed from the datasheet -- see s_ir_first. */
+        if (cb) { if (s_ir_first) cb(w1, w0); else cb(w0, w1); }
     }
     return n;
 

@@ -7,8 +7,10 @@
 #include "buzzer.h"
 #include "led.h"
 #include "i2c.h"
+#include "dbg.h"
 #include <avr/pgmspace.h>
 #include <util/delay.h>
+#include <avr/wdt.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -157,6 +159,53 @@ void ui_splash(void)
         _delay_ms(45);
     }
     _delay_ms(250);
+}
+
+/* Shows what the start-up channel probe concluded, so the answer is visible
+ * on the device instead of only on a serial link.  Held long enough to read;
+ * PROBE_OK passes by quickly because it is the uninteresting case. */
+void ui_probe_result(uint8_t verdict)
+{
+    gfx_clear();
+    gfx_text_P(2, 1, PSTR("SENSOR CHANNELS"), 1, C_WHITE);
+    gfx_hline(0, HDR_H - 1, 128, C_WHITE);
+    switch (verdict) {
+        case PROBE_REVERSED:
+            gfx_text_P(2, ROW(0), PSTR("IR/RED REVERSED"), 1, C_WHITE);
+            gfx_text_P(2, ROW(1), PSTR("corrected in driver"), 1, C_WHITE);
+            gfx_text_P(2, ROW(3), PSTR("this was the stuck"), 1, C_WHITE);
+            gfx_text_P(2, ROW(4), PSTR("SpO2 reading"), 1, C_WHITE);
+            break;
+        case PROBE_NORED:
+            gfx_text_P(2, ROW(0), PSTR("RED LED NOT SEEN"), 1, C_WHITE);
+            gfx_text_P(2, ROW(2), PSTR("dead or undriven"), 1, C_WHITE);
+            gfx_text_P(2, ROW(3), PSTR("emitter: no SpO2"), 1, C_WHITE);
+            gfx_text_P(2, ROW(4), PSTR("is possible"), 1, C_WHITE);
+            break;
+        case PROBE_NOIR:
+            gfx_text_P(2, ROW(0), PSTR("IR LED NOT SEEN"), 1, C_WHITE);
+            gfx_text_P(2, ROW(2), PSTR("dead or undriven"), 1, C_WHITE);
+            break;
+        case PROBE_BOTH:
+            gfx_text_P(2, ROW(0), PSTR("CANNOT TELL APART"), 1, C_WHITE);
+            gfx_text_P(2, ROW(2), PSTR("retry with a finger"), 1, C_WHITE);
+            gfx_text_P(2, ROW(3), PSTR("on, away from bright"), 1, C_WHITE);
+            gfx_text_P(2, ROW(4), PSTR("light"), 1, C_WHITE);
+            break;
+        default:
+            gfx_text_P(2, ROW(0), PSTR("ORDER OK"), 1, C_WHITE);
+            gfx_text_P(2, ROW(2), PSTR("RED then IR, as the"), 1, C_WHITE);
+            gfx_text_P(2, ROW(3), PSTR("datasheet specifies"), 1, C_WHITE);
+            break;
+    }
+    ssd1306_flush();
+    /* Not _delay_ms(): the watchdog is already armed at 2 s by the time this
+     * runs, and the interesting verdicts want longer than that on screen. */
+    {
+        uint32_t t    = millis();
+        uint16_t hold = (uint16_t)((verdict == PROBE_OK) ? 900 : 3500);
+        while ((uint32_t)(millis() - t) < hold) wdt_reset();
+    }
 }
 
 /* When the sensor will not answer, guessing is useless -- show what the bus
@@ -378,8 +427,21 @@ static void scr_monitor(void)
         gfx_text_P(78, 45, S_DASH3, 1, C_WHITE);
     }
 
-    /* --- acquisition progress or live trace --- */
-    if (!ppg.valid) {
+    /* --- acquisition progress, the reason for no SpO2, or the live trace --- */
+    if (ppg.spo2_rail) {
+        /* A pulse is being tracked but the ratio-of-ratios is outside the
+         * range the SpO2 curve is calibrated for, so there is no reading to
+         * show.  R itself is the diagnosis, so show it (x1000, the same
+         * scaling as the "r" field on the diagnostic UART): about 1/R of a
+         * plausible value means RED and IR are reversed, while an R that
+         * climbs when the room lights change or the finger shifts is
+         * common-mode interference. */
+        gfx_text_P(2, ROW(5), PSTR("NO SpO2 R"), 1, C_WHITE);
+        gfx_num(56, ROW(5), (int32_t)(((uint32_t)ppg.r_q12 * 1000UL) >> 12),
+                1, C_WHITE);
+        gfx_text_P(88, ROW(5), PSTR("c"), 1, C_WHITE);
+        gfx_num(94, ROW(5), (int32_t)ppg.corr_x100, 1, C_WHITE);
+    } else if (!ppg.valid) {
         gfx_text_P(2, ROW(5), PSTR("ACQ"), 1, C_WHITE);
         gfx_progress(24, 54, 102, 9, ppg.progress);
     } else {

@@ -7,6 +7,7 @@
 void ui_init(void);
 void ui_splash(void);
 void ui_sensor_error(void);      /* blocking retry screen */
+void ui_probe_result(uint8_t verdict);  /* start-up channel-probe outcome */
 void ui_event(btn_evt_t e);
 void ui_tick(void);              /* trend sampling + housekeeping */
 void ui_draw(void);              /* renders into fb; caller flushes */

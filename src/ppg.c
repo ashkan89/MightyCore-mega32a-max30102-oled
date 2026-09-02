@@ -43,6 +43,47 @@ uint8_t ppg_wave_head;
 #define SETTLE_SAMPLES 40       /* samples discarded after an AGC step      */
 #define LOCK_BEATS      4       /* beats before a reading is published      */
 
+/* Largest R the SpO2 curve is still calibrated for, in Q8.  295/256 = 1.152,
+ * which is where the polynomial passes 70 % -- the bottom of Maxim's table
+ * and the bottom of anything this optical front end can be trusted for. */
+#define R_TRUST_MAX   295
+
+/* --- AC amplitude and channel agreement, both taken from the reference ---
+ *
+ * Maxim's own algorithm (algorithm_by_RF.cpp, the RD117 successor) forms R
+ * from the RMS of each band-passed channel, not from its peak-to-peak span:
+ *
+ *     f_y_ac = rf_rms(an_y, n, &f_red_sumsq);      // RED
+ *     f_x_ac = rf_rms(an_x, n, &f_ir_sumsq);       // IR
+ *     xy_ratio = (f_y_ac*f_ir_mean)/(f_x_ac*f_red_mean);
+ *
+ * We do NOT follow it there, and the reason is measured rather than assumed:
+ * see the note in spo2_update().  An RMS taken from integer accumulators
+ * over a single beat loses more to quantisation on the weak RED channel than
+ * peak-to-peak loses to noise bias.
+ *
+ * The reference also gates on the Pearson correlation between the two
+ * band-passed channels and refuses to report at all below 0.8:
+ *
+ *     if(*correl >= min_pearson_correlation) { ... }
+ *     const float min_pearson_correlation = 0.8;
+ *
+ * A cardiac pulse drives RED and IR in lockstep, so a genuine measurement
+ * correlates at better than 0.95.  Ambient light, movement, optical
+ * crosstalk or a channel that is not seeing its emitter all break that
+ * lockstep while still leaving a plausible-looking R.  Correlation is
+ * therefore the test that separates "R is telling me about blood" from
+ * "R is telling me about something else", and it costs three running sums.
+ *
+ * Both need only Sx2, Sy2 and Sxy, so the correlation is free once the RMS
+ * is being accumulated:  r = Sxy / sqrt(Sx2 * Sy2).
+ */
+#define RMS_SHIFT       3       /* keeps the sums of squares inside a uint32 */
+#define RMS_Q_MAX    2047       /* per-sample clamp in the shifted domain    */
+#define RMS_N_MAX     512       /* and a cap on the window, for the same     */
+#define CORR_MIN_N      4       /* 0.8 as a fraction: correlation >= 4/5     */
+#define CORR_MIN_D      5
+
 /* Respiration (RIIV): the breathing cycle rides on the IR baseline.  A
  * 2-pole low-pass at 0.25 Hz removes the cardiac component, a slow
  * high-pass removes drift, and crossings of the result are counted over
@@ -119,6 +160,11 @@ typedef struct {
     uint32_t rir_min, rir_max;      /* raw IR       -> PI          */
     uint32_t rred_min, rred_max;    /* raw RED      -> diagnostics */
     uint8_t  win_valid;
+    /* RMS and cross-product accumulators for the window above.  Sx2/Sy2 give
+     * each channel's AC; Sxy with them gives the red/IR correlation. */
+    uint32_t ssq_ir, ssq_red;
+    int32_t  sxy;
+    uint16_t ssq_n;
 
     /* --- history rings --- */
     uint16_t ibi[IBI_HIST];
@@ -174,17 +220,22 @@ void ppg_reset_measure(void)
     s.r_env = 0;
     s.base_cnt = 0;
 
-    ppg.valid    = 0;
-    ppg.progress = 0;
-    ppg.bpm_x10  = 0;
-    ppg.spo2_x10 = 0;
-    ppg.pi_x100  = 0;
-    ppg.ibi_ms   = 0;
-    ppg.sdnn_ms  = 0;
-    ppg.rmssd_ms = 0;
-    ppg.resp_bpm = 0;
-    ppg.sqi      = 0;
-    ppg.wave     = 0;
+    ppg.valid     = 0;
+    ppg.progress  = 0;
+    ppg.bpm_x10   = 0;
+    ppg.spo2_x10  = 0;
+    ppg.pi_x100   = 0;
+    ppg.ibi_ms    = 0;
+    ppg.sdnn_ms   = 0;
+    ppg.rmssd_ms  = 0;
+    ppg.resp_bpm  = 0;
+    ppg.sqi       = 0;
+    ppg.wave      = 0;
+    ppg.spo2_rail = 0;
+    ppg.corr_x100 = 0;
+    ppg.fac_ir    = 0;
+    ppg.fac_red   = 0;
+    ppg.r_q12     = 0;
     memset(ppg_wave, 0, sizeof(ppg_wave));
 }
 
@@ -282,6 +333,50 @@ static void spo2_update(void)
     ppg.ac_red  = (uint16_t)racr;
     ppg.pi_x100 = (uint16_t)((raci * 10000UL) / ppg.dc_ir);
 
+    /* --- red/IR agreement gate, from the reference --- */
+    if (s.ssq_n < 16) return;                       /* too short to judge */
+    {
+        uint32_t rq_i = isqrt32(s.ssq_ir  / s.ssq_n);   /* RMS, shifted domain */
+        uint32_t rq_r = isqrt32(s.ssq_red / s.ssq_n);
+        int32_t  cx   = s.sxy / (int32_t)s.ssq_n;       /* mean cross product  */
+        uint32_t den;
+
+        if (rq_i == 0 || rq_r == 0) return;
+        den = rq_i * rq_r;
+
+        /* Pearson r = Sxy / sqrt(Sx2*Sy2) = cx / (rms_i*rms_r).  Compared as
+         * a fraction so no square root or float is needed, and so everything
+         * stays inside a uint32: cx and den are both at most RMS_Q_MAX^2 =
+         * 4.2e6, and five times that still fits.
+         *
+         * Only the RATIO of these sums is used, never their absolute size,
+         * which is why the coarse RMS_SHIFT quantisation is harmless here --
+         * it scales numerator and denominator alike. */
+        ppg.corr_x100 = (uint8_t)((cx <= 0) ? 0
+                        : ((uint32_t)cx >= den) ? 100
+                        : (uint8_t)(((uint32_t)cx * 100UL) / den));
+        if (cx <= 0 || (uint32_t)cx * CORR_MIN_D < den * CORR_MIN_N) {
+            /* RED and IR are not moving together, so whatever R comes out of
+             * them is not a measurement of blood.  The reference returns
+             * -999 here; we publish nothing and say why. */
+            ppg.spo2_rail = 2;
+            ppg.spo2_x10  = 0;
+            return;
+        }
+    }
+    /* The AC that forms R stays peak-to-peak, NOT the reference's RMS.
+     * The reference works in float over a four-second window, where the
+     * choice costs nothing; here the window is one beat and the arithmetic
+     * is integer, and an RMS taken from these shifted accumulators was
+     * measured at up to 7 % error on R against under 1.6 % for the span --
+     * quantisation of the weaker RED channel, which is exactly the channel
+     * that must not be degraded.  RMS was adopted upstream to stop noise
+     * inflating the span; the correlation gate above rejects those signals
+     * outright, which addresses the same problem without the precision
+     * cost. */
+    ppg.fac_ir  = (uint16_t)aci;
+    ppg.fac_red = (uint16_t)acr;
+
     ri = (aci << 16) / ppg.dc_ir;                   /* AC/DC in Q16 */
     rr = (acr << 16) / ppg.dc_red;
     if (ri < 1) ri = 1;
@@ -300,7 +395,27 @@ static void spo2_update(void)
         int32_t  r8  = med >> 4;                    /* R in Q8 */
         int32_t  r2, sp;
         ppg.r_q12 = med;
-        if (r8 > 640) r8 = 640;
+
+        /* The curve below is a fit to Maxim's reference table and is only
+         * meaningful over the range that table covers.  Past R = 1.152 it
+         * passes 70 % and dives -- it reaches zero at R = 1.9 and is negative
+         * beyond -- so an R out here is not a low saturation, it is a
+         * measurement that has gone wrong: the channels reversed, a
+         * non-pulsatile pedestal on IR, or common-mode interference such as
+         * ambient light or movement, which inflates R because RED has the
+         * smaller DC to divide by.
+         *
+         * This used to be handled by clamping sp to 700, which turned every
+         * one of those failures into a confident, immovable "70 %" on the
+         * display -- ppg.valid only asks that spo2_x10 be non-zero, so the
+         * firmware actively asserted a reading it had no basis for.  Report
+         * nothing instead, and raise a flag saying why. */
+        if (r8 > R_TRUST_MAX) {
+            ppg.spo2_rail = 1;
+            ppg.spo2_x10  = 0;
+            return;
+        }
+        ppg.spo2_rail = 0;
         if (r8 < 0)   r8 = 0;
         r2 = (r8 * r8) >> 8;
         /* SpO2 = -45.06*R^2 + 30.354*R + 94.845, evaluated in Q8 */
@@ -568,6 +683,9 @@ void ppg_process(uint32_t red, uint32_t ir)
         s.fred_min = s.fred_max = fr;
         s.rir_min  = s.rir_max  = ir;
         s.rred_min = s.rred_max = red;
+        s.ssq_ir = s.ssq_red = 0;
+        s.sxy    = 0;
+        s.ssq_n  = 0;
         s.win_valid = 1;
     } else {
         if (f  > s.fir_max)  s.fir_max  = f;
@@ -578,6 +696,23 @@ void ppg_process(uint32_t red, uint32_t ir)
         if (ir  < s.rir_min)  s.rir_min  = ir;
         if (red > s.rred_max) s.rred_max = red;
         if (red < s.rred_min) s.rred_min = red;
+    }
+
+    /* Sums of squares and the cross product, over the same window.  Both
+     * channels are shifted and clamped identically, so the scaling cancels
+     * in the ratio and in the correlation; the cap on the window keeps the
+     * worst case inside a uint32 (2047^2 * 512 = 2.1e9). */
+    if (s.ssq_n < RMS_N_MAX) {
+        int32_t qi = f  >> RMS_SHIFT;
+        int32_t qr = fr >> RMS_SHIFT;
+        if (qi >  RMS_Q_MAX) qi =  RMS_Q_MAX;
+        if (qi < -RMS_Q_MAX) qi = -RMS_Q_MAX;
+        if (qr >  RMS_Q_MAX) qr =  RMS_Q_MAX;
+        if (qr < -RMS_Q_MAX) qr = -RMS_Q_MAX;
+        s.ssq_ir  += (uint32_t)(qi * qi);
+        s.ssq_red += (uint32_t)(qr * qr);
+        s.sxy     += qi * qr;
+        s.ssq_n++;
     }
 
     /* ---- per-cycle peak and trough, reset at each beat ---- */
@@ -629,14 +764,30 @@ void ppg_process(uint32_t red, uint32_t ir)
          * ceiling throws away the strong pulse a well-placed finger actually
          * gives.  So reject only a flat trace, keep the window wide, track
          * the average on EVERY crossing so it can never get stuck, and let
-         * the median downstream deal with the outliers. */
+         * the median downstream deal with the outliers.
+         *
+         * The average is updated BEFORE the window test, which is what
+         * "on EVERY crossing" has to mean for the claim above to hold.  With
+         * the update below the early return it only ever saw crossings that
+         * had already passed, so one unrepresentative first crossing latched
+         * it and locked the detector out permanently: settling right after a
+         * finger latches produces a crossing of a few tens of counts, that
+         * set amp_avg to ~36, and every real beat at ~1000 counts then failed
+         * pp > (amp_avg << 3) = 288 for ever.  No beats means the 15 s
+         * no-pulse timeout drops the finger and arms s.no_arm, which will not
+         * clear while the finger is still on the sensor -- so the device sat
+         * there with a perfect trace, reporting nothing, until it was lifted.
+         * Whether the first crossing landed in the fatal band (above
+         * AMP_MIN_BEAT but under an eighth of the real pulse) came down to
+         * noise, which is what made it intermittent. */
+        s.amp_avg = s.amp_avg ? (s.amp_avg + ((pp - s.amp_avg) >> 3)) : pp;
+
         if (pp < AMP_MIN_BEAT ||
-            (s.amp_avg && (pp < (s.amp_avg >> 3) || pp > (s.amp_avg << 3)))) {
+            (pp < (s.amp_avg >> 3) || pp > (s.amp_avg << 3))) {
             dbg_beat(0, (uint16_t)((pp > 65535) ? 65535 : pp), BEAT_AMP);
             s.fprev = f;
             return;                             /* keeps the reference time */
         }
-        s.amp_avg = s.amp_avg ? (s.amp_avg + ((pp - s.amp_avg) >> 3)) : pp;
 
         if (s.t_cross_q8) {
             uint32_t dt_q8  = t_q8 - s.t_cross_q8;

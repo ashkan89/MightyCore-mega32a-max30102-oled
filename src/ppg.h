@@ -34,7 +34,18 @@ typedef struct {
     uint32_t base_ir;       /* learned no-finger IR level, for display     */
     uint32_t refl_ir;       /* IR DC normalised to the reference LED drive */
     uint16_t ac_ir, ac_red;
+    /* The band-passed AC spans that actually form R, as opposed to ac_ir /
+     * ac_red above, which are the RAW spans and only feed the perfusion
+     * index.  Reported separately because a wrong R is nearly always one
+     * channel's AC being wrong, and the raw figures cannot show which. */
+    uint16_t fac_ir, fac_red;
     uint16_t r_q12;         /* ratio-of-ratios R in Q12                   */
+    /* 0 = a reading was published; 1 = R outside the calibration curve's
+     * domain; 2 = RED and IR failed the correlation gate, so the pair does
+     * not describe a pulse at all.  The two are very different faults and
+     * the display says which. */
+    uint8_t  spo2_rail;
+    uint8_t  corr_x100;     /* red/IR Pearson correlation, 0..100          */
     uint8_t  led_ir, led_red;
     uint16_t fs_x100;       /* calibrated sample rate x100, used for timing */
     uint16_t sps;           /* raw samples actually received per second     */

@@ -7,6 +7,7 @@
 #include "max30102.h"
 #include "i2c.h"
 #include <avr/pgmspace.h>
+#include <avr/wdt.h>
 
 /* U2X doubles the sampler rate, which halves the divisor error.  At 16 MHz
  * and 38400 that lands within 0.2 %, against 2.1 % for 115200 -- worth the
@@ -81,6 +82,136 @@ void dbg_beat(uint16_t ibi_ms, uint16_t amp, uint8_t code)
     tx_P(PSTR("\r\n"));
 }
 
+/* ------------------------------------------------------------------
+ *  Channel identification probe
+ *
+ *  Everything downstream of the FIFO assumes the first 3-byte word of each
+ *  sample is RED and the second is IR, which is what the MAX30102 datasheet
+ *  specifies for SpO2 mode (0x03) and what the SparkFun reference reads.  If
+ *  a part does not honour that -- a relabelled die, clone silicon, anything
+ *  whose PART_ID is not 0x15 -- then every AC/DC ratio comes out inverted and
+ *  the ratio-of-ratios lands at 1/R.  R then sits above the SpO2 curve's
+ *  domain for every real saturation, which reads on the display as an SpO2
+ *  that never moves.  No amount of staring at the DSP finds that, because the
+ *  DSP is correct; the labels on its inputs are not.
+ *
+ *  So ask the hardware instead of assuming.  Drive one emitter at a time and
+ *  see which word of the pair follows it.  That is a direct, physical answer
+ *  and it needs no finger -- the light piped through the module's own plastic
+ *  is plenty -- though a finger makes the contrast larger.
+ * ------------------------------------------------------------------ */
+static uint32_t p_w0, p_w1;
+static uint16_t p_n;
+
+static void probe_cb(uint32_t red, uint32_t ir)
+{
+    /* Named by position, NOT by meaning: w0 is whatever arrives first.
+     * Deciding which one is RED is the entire point of the exercise. */
+    p_w0 += red;
+    p_w1 += ir;
+    p_n++;
+}
+
+static void probe_wait(uint16_t ms)
+{
+    uint32_t t = millis();
+    while ((uint32_t)(millis() - t) < ms) wdt_reset();
+}
+
+/* Returns the two means in *m0 / *m1. */
+static void probe_one(const char *label_P, uint8_t pa1, uint8_t pa2,
+                      uint32_t *m0, uint32_t *m1)
+{
+    uint32_t t;
+
+    max30102_set_leds(pa1, pa2);
+    probe_wait(150);                  /* let the front end settle ... */
+    max30102_flush_fifo();            /* ... then drop what was queued before */
+
+    p_w0 = p_w1 = 0;
+    p_n  = 0;
+    t = millis();
+    while ((uint32_t)(millis() - t) < 400 && p_n < 200) {
+        wdt_reset();
+        max30102_read(probe_cb, 8);
+    }
+
+    *m0 = p_n ? (p_w0 / p_n) : 0;
+    *m1 = p_n ? (p_w1 / p_n) : 0;
+
+    tx_P(PSTR("P "));
+    tx_P(label_P);
+    f_hex(PSTR("pa1"), pa1);
+    f_hex(PSTR("pa2"), pa2);
+    f_dec(PSTR("n"),    p_n);
+    f_dec(PSTR("word0"), *m0);
+    f_dec(PSTR("word1"), *m1);
+    tx_P(PSTR("\r\n"));
+}
+
+uint8_t dbg_channel_probe(void)
+{
+    uint32_t d0, d1, r0, r1, i0, i1;
+    uint8_t  red_is_w0, red_is_w1, ir_is_w1, ir_is_w0, verdict;
+
+    /* Terse on purpose: this build is close to the flash ceiling, and the
+     * three data lines above carry the whole answer anyway. */
+    tx_P(PSTR("\r\nP probe pa1=LED1(RED) pa2=LED2(IR)\r\n"));
+
+    /* Probe against the datasheet order so probe_cb()'s two arguments really
+     * are word0 and word1 by position.  Which of them is RED is the question
+     * being asked, so it must not be assumed while asking it. */
+    max30102_set_word_order(0);
+
+    probe_one(PSTR("dark"), 0x00,        0x00,        &d0, &d1);
+    probe_one(PSTR("red "), LED_PA_MAX,  0x00,        &r0, &r1);
+    probe_one(PSTR("ir  "), 0x00,        LED_PA_MAX,  &i0, &i1);
+
+    /* A word has "responded" only if it rose well clear of the dark reading,
+     * so ambient drift between the passes cannot decide the verdict. */
+    #define ROSE(v, dark)  ((v) > (dark) + 200u + ((dark) >> 2))
+
+    red_is_w0 = (uint8_t)(ROSE(r0, d0) && !ROSE(r1, d1));
+    red_is_w1 = (uint8_t)(ROSE(r1, d1) && !ROSE(r0, d0));
+    ir_is_w1  = (uint8_t)(ROSE(i1, d1) && !ROSE(i0, d0));
+    ir_is_w0  = (uint8_t)(ROSE(i0, d0) && !ROSE(i1, d1));
+
+    /* One token, decoded in the notes above dbg_channel_probe():
+     *   OK          word0=RED word1=IR -- the order the driver assumes, so a
+     *               stuck SpO2 is something else; read ir/red/aci/acr
+     *   REVERSED    word0=IR word1=RED -- every R arrives as 1/R.  Swap the
+     *               two words in max30102_read()
+     *   NORED/NOIR  that emitter never moved either word: dead or undriven,
+     *               which leaves its channel reading noise and inflates R
+     *   BOTH        no optical separation; retry with a finger on, out of
+     *               strong ambient light */
+    tx_P(PSTR("P order="));
+    if (red_is_w0 && ir_is_w1) {
+        verdict = PROBE_OK;
+        tx_P(PSTR("OK"));
+    } else if (red_is_w1 && ir_is_w0) {
+        /* Act on it rather than just reporting it.  Only a clear verdict gets
+         * here: one word had to rise well clear of dark while the other did
+         * not, for BOTH emitters, so ambient drift cannot flip the decode.
+         * Anything less certain leaves the datasheet order in place. */
+        max30102_set_word_order(1);
+        verdict = PROBE_REVERSED;
+        tx_P(PSTR("REVERSED->swapped"));
+    } else if (!ROSE(r0, d0) && !ROSE(r1, d1)) {
+        verdict = PROBE_NORED;
+        tx_P(PSTR("NORED"));
+    } else if (!ROSE(i0, d0) && !ROSE(i1, d1)) {
+        verdict = PROBE_NOIR;
+        tx_P(PSTR("NOIR"));
+    } else {
+        verdict = PROBE_BOTH;
+        tx_P(PSTR("BOTH"));
+    }
+    tx_P(PSTR("\r\n"));
+    #undef ROSE
+    return verdict;
+}
+
 void dbg_service(void)
 {
     static uint32_t next_ms, loop_mark;
@@ -116,7 +247,11 @@ void dbg_service(void)
     f_dec(PSTR("base"), ppg.base_ir);            /* learned idle level     */
     f_dec(PSTR("th"),   ppg.finger_th);          /* ir has to pass this    */
     f_dec(PSTR("fgr"),  ppg.finger);
+    /* Both drives, because the AGC walks them independently: a RED that has
+     * railed at the ceiling while IR sits low says the red return is weak,
+     * which is one of the ways R comes out too high. */
     f_hex(PSTR("led"),  ppg.led_ir);
+    f_hex(PSTR("ledr"), ppg.led_red);
 
     /* --- measurement --- */
     f_dec(PSTR("bpm"),  ppg.bpm_x10 / 10U);
@@ -124,6 +259,36 @@ void dbg_service(void)
     f_dec(PSTR("bts"),  ppg.beats);
     f_dec(PSTR("rej"),  ppg.rejects);
     f_dec(PSTR("val"),  ppg.valid);
+
+    /* --- the SpO2 measurement itself ---
+     * Everything R is built from, so a wrong SpO2 can be attributed rather
+     * than guessed at.  R is printed x1000; the firmware's own numbers must
+     * satisfy  r = (acr/red) / (aci/ir) x 1000, and if they do not, the fault
+     * is in the arithmetic rather than in the optics.
+     *
+     *   r  400.. 800   normal.  SpO2 94..99, and sp should agree with it
+     *   r 1300..2300   RED and IR are the wrong way round: R has come back
+     *                  as 1/R.  Cross-check with pi, which reads about
+     *                  R x the true perfusion when the channels are swapped
+     *   r  rising with ambient light, movement or a loose finger: common-mode
+     *                  interference.  It lands on both channels as the same
+     *                  ADC counts, and RED has the smaller DC to divide by,
+     *                  so it always pushes R up and SpO2 down
+     *   rail=1         R past the curve's domain, so no reading is published
+     */
+    f_dec(PSTR("r"),    ((uint32_t)ppg.r_q12 * 1000UL) >> 12);
+    f_dec(PSTR("aci"),  ppg.fac_ir);         /* band-passed IR  span -> R */
+    f_dec(PSTR("acr"),  ppg.fac_red);        /* band-passed RED span -> R */
+    f_dec(PSTR("pi"),   ppg.pi_x100);
+    /* corr is the red/IR Pearson correlation x100 -- the reference's own
+     * quality gate.  It is what separates the two ways R goes wrong:
+     *   corr >= 80 with a high r : both channels carry a real, in-step pulse
+     *                              but the ratio is inverted -> channel order
+     *   corr <  80               : RED is not tracking the pulse at all
+     *                              -> dead/unseen emitter, or noise */
+    f_dec(PSTR("corr"), ppg.corr_x100);
+    f_dec(PSTR("rail"), ppg.spo2_rail);
+    f_dec(PSTR("swap"), max30102_ir_first());   /* what the probe decided */
 
     /* --- bus health: err, stk and a non-3 ln all mean trouble --- */
     f_dec(PSTR("err"),  max30102_errors());

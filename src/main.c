@@ -78,6 +78,13 @@ int main(void)
     sensor_bring_up();
 
     max30102_set_avg(cfg.avg_code);
+    /* Identify the FIFO channel order against the hardware before the DSP
+     * starts trusting it.  Costs about 1.7 s of start-up and prints its
+     * verdict on the diagnostic UART; set DBG_LED_PROBE to 0 in config.h
+     * once the answer is known.  ppg_init() below reprograms the drives. */
+#if DBG_LED_PROBE
+    ui_probe_result(dbg_channel_probe());
+#endif
     ppg_init();
     ui_init();
     btn_flush();

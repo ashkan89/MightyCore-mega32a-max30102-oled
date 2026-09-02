@@ -62,6 +62,12 @@
  *  "name=value" line per second; see dbg.c.  Set to 0 to compile it out. */
 #define DBG_UART     1
 #define DBG_BAUD     38400UL
+/*  One-shot LED/FIFO channel identification at start-up, printed over the
+ *  same UART -- see dbg_channel_probe().  It answers, from the hardware
+ *  rather than from the datasheet, which word of each FIFO sample belongs to
+ *  which emitter, because a part that disagrees inverts every SpO2 ratio.
+ *  Adds about 1.7 s to boot, so turn it off once the answer is known. */
+#define DBG_LED_PROBE 1
 
 /* ---------------- Sensor / DSP ---------------- */
 #define PPG_FS_NOM   100u      /* nominal sample rate after averaging */
