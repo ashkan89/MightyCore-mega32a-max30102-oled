@@ -133,6 +133,28 @@
 #define DBG_LED_PROBE 1
 #endif
 
+/*  Manual override for the FIFO channel order, for when you already know
+ *  the answer and do not want to depend on the probe or on EEPROM.
+ *
+ *   -1  use the probe's cached verdict (default)
+ *    0  force the datasheet order: word0 = RED, word1 = IR
+ *    1  force reversed: word0 = IR, word1 = RED
+ *
+ *  Set this to 1 if the display reports a high R -- roughly 1.3 to 2.3 --
+ *  with the channel correlation up at 95 or above.  That combination means
+ *  both channels carry a real, in-step pulse but the ratio has arrived as
+ *  1/R, and forcing the order is the fix.  Cross-check by taking the
+ *  reciprocal: an R of 1.8 is really 0.55, which is about 98 % -- if the
+ *  reciprocal lands in the plausible 0.4..0.9 band, the order is the
+ *  problem.  Overriding also skips the probe entirely.
+ *
+ *  Pass it from platformio.ini rather than editing this line:
+ *      build_flags = ${common.build_flags} -DSENSOR_WORD_ORDER=1
+ */
+#ifndef SENSOR_WORD_ORDER
+#define SENSOR_WORD_ORDER (-1)
+#endif
+
 /* ---------------- Sensor / DSP ---------------- */
 #define PPG_FS_NOM   100u      /* nominal sample rate after averaging */
 #define WAVE_LEN     128       /* pixels of live waveform history     */

@@ -109,10 +109,16 @@ int main(void)
      * established on this very board -- reintroducing the exact fault the
      * probe exists to catch, in the one build where it matters most.
      */
+#if SENSOR_WORD_ORDER >= 0
+    /* Told explicitly, so neither the probe nor the EEPROM gets a say.
+     * See SENSOR_WORD_ORDER in config.h. */
+    max30102_set_word_order(SENSOR_WORD_ORDER);
+#else
     if (cfg.probe_v != PROBE_UNKNOWN)
         max30102_set_word_order((uint8_t)(cfg.probe_v == PROBE_REVERSED));
+#endif
 
-#if DBG_LED_PROBE
+#if DBG_LED_PROBE && SENSOR_WORD_ORDER < 0
     /* Then probe only if the cached answer does not apply: never
      * established, or established against a different part.  The probe
      * costs about 5 s of start-up between the three optical passes and the
@@ -125,9 +131,21 @@ int main(void)
     if (max30102_present() &&
         (cfg.probe_v == PROBE_UNKNOWN || cfg.probe_id != max30102_part_id())) {
         uint8_t v = dbg_channel_probe();     /* sets the word order itself */
-        cfg.probe_v  = v;
-        cfg.probe_id = max30102_part_id();
-        settings_save();                     /* once per sensor, not per boot */
+        /* Only a CONCLUSIVE verdict is cached.  NORED, NOIR and BOTH all
+         * mean the probe could not tell -- the result screen says to retry
+         * with a finger on and out of bright light -- and caching one of
+         * those made retrying impossible: the cache is no longer
+         * PROBE_UNKNOWN, so the probe never runs again, while
+         * `probe_v == PROBE_REVERSED` stays false and the datasheet order
+         * is left in place for good.  One inconclusive probe therefore
+         * used to lock in the wrong channel order permanently, which is
+         * exactly the fault the probe exists to prevent.  Leave the cache
+         * alone instead, so the next boot tries again. */
+        if (v == PROBE_OK || v == PROBE_REVERSED) {
+            cfg.probe_v  = v;
+            cfg.probe_id = max30102_part_id();
+            settings_save();                 /* once per sensor, not per boot */
+        }
         ui_probe_result(v);
     }
 #endif

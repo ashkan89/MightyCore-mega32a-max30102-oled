@@ -357,6 +357,47 @@ driver's own verdict:
 - `CFG BAD: not set up` — the writes are not landing. That is a **bus**
   problem; the `TW`/`E`/`S` counters on the same screen say how it is failing.
 
+### "NO SpO2  R nnnn  c nn"
+
+A pulse is being tracked but no saturation is published. The two numbers say
+why. `R` is the ratio-of-ratios ×1000; `c` is the red/IR correlation ×100.
+
+| `R` | `c` | Diagnosis |
+|---|---|---|
+| **1300–2300** | **≥ 95** | **Channels reversed.** Both channels carry a real, in-step pulse, but *R* has arrived as 1/*R*. Take the reciprocal: 1822 → 1/1.822 = 0.549 → 97.9 %, a plausible healthy reading. Fix below. |
+| > 1200 | < 80 | Red is not tracking the pulse at all — dead or unseen emitter. Run `env:probe`; expect `NORED`. |
+| 900–1300 | 80–100 | Common-mode interference: ambient light or movement lands on both channels equally, and red has the smaller DC to divide by, so it always pushes *R* up. Shroud the sensor, move away from windows, fluorescent lamps and IR remotes, and press a little firmer. |
+| < 400 | any | Implausibly low — usually a red AC span inflated by noise on a very weak signal. Check `pi`; below 0.2 % there is not enough signal to measure. |
+
+**Fixing a reversed pair.** Two ways:
+
+1. **Run the probe** — `pio run -e probe -t upload`. It drives one emitter at a
+   time and reports which FIFO word follows, then stores the verdict in EEPROM
+   where every other build reads it. Expect `IR/RED REVERSED`. Then reflash the
+   build you normally run. A finger on the sensor and dim surroundings make the
+   verdict more reliable.
+
+2. **Tell it directly**, if you already know the answer or the probe is
+   inconclusive — add to your environment in [platformio.ini](platformio.ini):
+
+   ```ini
+   build_flags = ${common.build_flags} -DSENSOR_WORD_ORDER=1
+   ```
+
+   `1` forces reversed, `0` forces the datasheet order, `-1` (default) uses the
+   probe's cached verdict. Setting it skips the probe entirely and does not
+   depend on EEPROM surviving.
+
+> **If you upgraded from 1.0.0 and this appeared:** that is expected on a part
+> with reversed channels. 1.0.0 ran the probe on *every* boot; 1.1.0 caches the
+> verdict and the default build has no probe compiled in, so a board that has
+> never run `env:probe` has an empty cache and falls back to the datasheet
+> order. Run `env:probe` once, or set `SENSOR_WORD_ORDER`.
+
+Note that `pio run -t upload` is flash-only and preserves the cache, but
+`arduino-cli` and `make flash` write `pulseox.eep` and **wipe it** — after those,
+re-run `env:probe`.
+
 Other things worth checking:
 
 - **Module power.** Most GY-MAX30102 breakouts need `VIN` on 3.3–5 V and have
@@ -699,9 +740,11 @@ inputs are not.
 | `NORED` / `NOIR` | that emitter moved neither word — dead or undriven |
 | `BOTH` | no optical separation. Retry with a finger on, out of bright light |
 
-The verdict and the part ID it was established against are stored in EEPROM, so
-this runs once per sensor rather than on every boot. A factory reset or a
-different part re-arms it.
+Only `OK` and `REVERSED` are cached — the three inconclusive verdicts leave the
+cache alone so the next boot tries again. The verdict and the part ID it was
+established against are stored in EEPROM, so a conclusive answer is reached once
+per sensor rather than on every boot. A factory reset or a different part
+re-arms it, and `SENSOR_WORD_ORDER` overrides the whole mechanism.
 
 ---
 
@@ -1011,7 +1054,7 @@ and after — see [Capturing data](#8-capturing-data).
   single-point offset that cannot correct its shape at low saturation.
 - **Respiration is experimental** and reports nothing more often than it reports
   a number.
-- The **`probe` build has 914 B of flash headroom** and the default build
+- The **`probe` build has 910 B of flash headroom** and the default build
   1 660 B. There is not room for both the channel probe and the verbose status
   line, which is why they are separate environments.
 - **`OVF_COUNTER` behaviour on this hardware is unresolved** — the datasheet and
@@ -1102,7 +1145,12 @@ and after — see [Capturing data](#8-capturing-data).
   screens, the menu and auto-sleep reachable.
 - The channel-probe verdict is cached in EEPROM and applied unconditionally at
   startup — including in builds with no probe compiled in, which previously
-  dropped a correction already established on that board.
+  dropped a correction already established on that board. Only **conclusive**
+  verdicts are cached: caching a `NORED`/`NOIR`/`BOTH` result made the probe
+  never run again while leaving the datasheet order in place, so one
+  inconclusive probe could lock in the wrong channel order permanently.
+- `SENSOR_WORD_ORDER` forces the channel order from the build, for when the
+  answer is already known or the probe cannot settle it.
 
 **Production readiness**
 
