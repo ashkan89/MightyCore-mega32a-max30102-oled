@@ -166,39 +166,49 @@ void ui_splash(void)
  * PROBE_OK passes by quickly because it is the uninteresting case. */
 void ui_probe_result(uint8_t verdict)
 {
+    /* Declared separately on purpose: PGM_P is a macro for "const char *",
+     * so "PGM_P a, b" would make b a const char rather than a pointer. */
+    PGM_P line1;
+    PGM_P line2;
+
+    /* Deliberately terse.  The verdict is cached in EEPROM now, so this
+     * screen appears once per sensor rather than on every boot, and the
+     * diagnostic UART carries the three data lines the decision was made
+     * from -- which is where anyone investigating will be looking anyway.
+     * The long per-verdict explanations this replaced cost several hundred
+     * bytes of flash on a build with under 200 to spare, to say on a
+     * 21-column display what the README says properly. */
+    switch (verdict) {
+        case PROBE_REVERSED:
+            line1 = PSTR("IR/RED REVERSED");
+            line2 = PSTR("corrected in driver");
+            break;
+        case PROBE_NORED:
+            line1 = PSTR("RED LED NOT SEEN");
+            line2 = PSTR("no SpO2 possible");
+            break;
+        case PROBE_NOIR:
+            line1 = PSTR("IR LED NOT SEEN");
+            line2 = PSTR("dead or undriven");
+            break;
+        case PROBE_BOTH:
+            line1 = PSTR("CANNOT TELL APART");
+            line2 = PSTR("retry, finger on");
+            break;
+        default:
+            line1 = PSTR("ORDER OK");
+            line2 = PSTR("RED then IR");
+            break;
+    }
+
     gfx_clear();
     gfx_text_P(2, 1, PSTR("SENSOR CHANNELS"), 1, C_WHITE);
     gfx_hline(0, HDR_H - 1, 128, C_WHITE);
-    switch (verdict) {
-        case PROBE_REVERSED:
-            gfx_text_P(2, ROW(0), PSTR("IR/RED REVERSED"), 1, C_WHITE);
-            gfx_text_P(2, ROW(1), PSTR("corrected in driver"), 1, C_WHITE);
-            gfx_text_P(2, ROW(3), PSTR("this was the stuck"), 1, C_WHITE);
-            gfx_text_P(2, ROW(4), PSTR("SpO2 reading"), 1, C_WHITE);
-            break;
-        case PROBE_NORED:
-            gfx_text_P(2, ROW(0), PSTR("RED LED NOT SEEN"), 1, C_WHITE);
-            gfx_text_P(2, ROW(2), PSTR("dead or undriven"), 1, C_WHITE);
-            gfx_text_P(2, ROW(3), PSTR("emitter: no SpO2"), 1, C_WHITE);
-            gfx_text_P(2, ROW(4), PSTR("is possible"), 1, C_WHITE);
-            break;
-        case PROBE_NOIR:
-            gfx_text_P(2, ROW(0), PSTR("IR LED NOT SEEN"), 1, C_WHITE);
-            gfx_text_P(2, ROW(2), PSTR("dead or undriven"), 1, C_WHITE);
-            break;
-        case PROBE_BOTH:
-            gfx_text_P(2, ROW(0), PSTR("CANNOT TELL APART"), 1, C_WHITE);
-            gfx_text_P(2, ROW(2), PSTR("retry with a finger"), 1, C_WHITE);
-            gfx_text_P(2, ROW(3), PSTR("on, away from bright"), 1, C_WHITE);
-            gfx_text_P(2, ROW(4), PSTR("light"), 1, C_WHITE);
-            break;
-        default:
-            gfx_text_P(2, ROW(0), PSTR("ORDER OK"), 1, C_WHITE);
-            gfx_text_P(2, ROW(2), PSTR("RED then IR, as the"), 1, C_WHITE);
-            gfx_text_P(2, ROW(3), PSTR("datasheet specifies"), 1, C_WHITE);
-            break;
-    }
+    gfx_text_P(2, ROW(1), line1, 1, C_WHITE);
+    gfx_text_P(2, ROW(2), line2, 1, C_WHITE);
+    gfx_text_P(2, ROW(4), PSTR("see diag UART / README"), 1, C_WHITE);
     ssd1306_flush();
+
     /* Not _delay_ms(): the watchdog is already armed at 2 s by the time this
      * runs, and the interesting verdicts want longer than that on screen. */
     {
@@ -257,9 +267,11 @@ void ui_sensor_error(void)
     }
 
     if (max30102_id_acked()) {
+        /* The expected value (0x15) is in the README and on the SENSOR
+         * screen; spending a string on it here bought nothing that the
+         * displayed ID does not already tell someone who has read either. */
         gfx_text_P(2, 43, PSTR("0x57 ID"), 1, C_WHITE);
         hex8(46, 43, max30102_part_id());
-        gfx_text_P(76, 43, PSTR("need 15"), 1, C_WHITE);
     } else {
         gfx_text_P(2, 43, PSTR("0x57 did not answer"), 1, C_WHITE);
     }
@@ -349,20 +361,26 @@ static void scr_monitor(void)
          * if it matches what we wrote, the bus is fine and the sensor simply
          * is not converting -- which is a power problem, not a code one. */
         static uint32_t rb_ms;
-        static uint8_t  mode, spo2, fifo, wr, ovf, rd, got;
+        static uint8_t  mode, spo2, fifo, wr, ovf, rd, got, ok;
         uint32_t nw = millis();
         if (!got || (uint32_t)(nw - rb_ms) >= 500) {
             got = 1; rb_ms = nw;
             max30102_readback(&mode, &spo2, &fifo);
+            ok = max30102_config_ok();
             if (!max30102_ptrs(&wr, &ovf, &rd)) { wr = ovf = rd = 0xEE; }
         }
         gfx_text_P(8, ROW(0), PSTR("NO DATA FROM SENSOR"), 1, C_WHITE);
-        /* MODE_CFG, SPO2_CFG and FIFO_CFG read back off the chip.  MODE and
-         * SPO2 have single correct values; FIFO_CFG's top bits are the
-         * averaging setting, so only the rollover bit is checked here. */
+        /* MODE_CFG, SPO2_CFG and FIFO_CFG read back off the chip, and the
+         * driver's own verdict on whether they are what it wrote.  This
+         * used to print the expected values as a literal, which only held
+         * at the default averaging setting -- SPO2_CFG's sample-rate field
+         * tracks it now.  CFG OK here plus no samples means the part is
+         * configured and simply not converting, which is a power problem
+         * rather than a code or bus one. */
         gfx_text_P(2, ROW(1), PSTR("REG"), 1, C_WHITE);
         hex8(26, ROW(1), mode); hex8(56, ROW(1), spo2); hex8(86, ROW(1), fifo);
-        gfx_text_P(2, ROW(2), PSTR("want  03    2F    50"), 1, C_WHITE);
+        gfx_text_P(2, ROW(2), ok ? PSTR("CFG OK, not running")
+                                 : PSTR("CFG BAD: not set up"), 1, C_WHITE);
         gfx_text_P(2, ROW(3), PSTR("WR"), 1, C_WHITE);  hex8(20, ROW(3), wr);
         gfx_text_P(52, ROW(3), PSTR("RD"), 1, C_WHITE); hex8(70, ROW(3), rd);
         /* Bus health.  TW/st is the last TWI failure, E the consecutive
@@ -569,10 +587,13 @@ static void scr_stats(void)
 /* ======================= screen: sensor ======================= */
 static void hex8(int16_t x, int16_t y, uint8_t v)
 {
-    const char *h = "0123456789ABCDEF";
+    /* PROGMEM, not a plain string literal: as written this table was
+     * copied into .data at start-up and sat in SRAM for the life of the
+     * device, and SRAM is the scarcer of the two here. */
+    static const char h[] PROGMEM = "0123456789ABCDEF";
     gfx_text_P(x, y, PSTR("0x"), 1, C_WHITE);
-    gfx_char((int16_t)(x + 12), y, h[v >> 4],   1, C_WHITE);
-    gfx_char((int16_t)(x + 18), y, h[v & 0x0F], 1, C_WHITE);
+    gfx_char((int16_t)(x + 12), y, (char)pgm_read_byte(&h[v >> 4]),   1, C_WHITE);
+    gfx_char((int16_t)(x + 18), y, (char)pgm_read_byte(&h[v & 0x0F]), 1, C_WHITE);
 }
 
 static void scr_sensor(void)
@@ -624,7 +645,25 @@ static void scr_help(void)
     gfx_text_P(2, ROW(1), PSTR("2 press  back"), 1, C_WHITE);
     gfx_text_P(2, ROW(2), PSTR("hold     menu/OK"), 1, C_WHITE);
     gfx_hline(0, ROW(3) + 3, 128, C_WHITE);
-    gfx_text_P(2, ROW(4), PSTR("ATmega32 + MAX30102"), 1, C_WHITE);
+    /* Device health, in place of a line that just restated the hardware
+     * the label on the box already gives.
+     *
+     * RST is why the board last restarted -- P power-on, E external,
+     * B brown-out, W watchdog.  A device that has been running for days
+     * and quietly rebooted is otherwise indistinguishable from one just
+     * switched on, and W here is the difference between "the watchdog is
+     * rescuing us over and over" and "nothing is wrong".
+     *
+     * STK is the unused stack, in bytes, measured rather than estimated
+     * (see sys_stack_free()).  With 2 KB of SRAM and a 1 KB framebuffer
+     * in it this is the number that says whether the margin is real.  It
+     * should settle in the first minute and then hold; a figure that
+     * keeps falling is something leaking into the stack, and 0 means the
+     * stack has already reached .bss. */
+    gfx_text_P(2, ROW(4), PSTR("RST"), 1, C_WHITE);
+    gfx_char(26, ROW(4), sys_reset_cause_ch(), 1, C_WHITE);
+    gfx_text_P(44, ROW(4), PSTR("STK"), 1, C_WHITE);
+    gfx_num(68, ROW(4), (int32_t)sys_stack_free(), 1, C_WHITE);
     gfx_text_P(2, ROW(5), PSTR("diag: UART0 38400 8N1"), 1, C_WHITE);
 }
 
@@ -795,9 +834,14 @@ static void edit_next(void)
 {
     switch (s_sel) {
         case MI_LED:      cfg.led_mode = (uint8_t)((cfg.led_mode + 1) & 3); break;
-        case MI_AVG:      cfg.avg_code = (uint8_t)((cfg.avg_code + 1) % 6);
+        case MI_AVG:      cfg.avg_code = (uint8_t)((cfg.avg_code + 1)
+                                                     % (MAX_AVG_MAX + 1));
                           max30102_set_avg(cfg.avg_code);
-                          ppg_reset_measure(); break;
+                          /* Not ppg_reset_measure(): the rate calibration
+                           * was measured before the change and the FIFO has
+                           * just been flushed, so the estimator has to be
+                           * restarted too. */
+                          ppg_rate_changed(); break;
         case MI_CAL:      cfg.spo2_cal = (int8_t)(cfg.spo2_cal + 5);
                           if (cfg.spo2_cal > 50) cfg.spo2_cal = -50;
                           break;
@@ -838,7 +882,12 @@ static void run_action(uint8_t i)
             break;
         case MI_FACTORY:
             settings_defaults();
-            settings_apply();
+            settings_apply();       /* pushes contrast/flip/averaging out */
+            /* settings_apply() may have changed the averaging setting,
+             * which flushes the FIFO and invalidates the rate
+             * calibration -- so the estimator has to be restarted, not
+             * left averaging across the discontinuity. */
+            ppg_rate_changed();
             toast(S_DEFAULTS);
             break;
         case MI_HELP:
@@ -900,7 +949,8 @@ void ui_event(btn_evt_t e)
                 switch (s_sel) {
                     case MI_LED:      cfg.led_mode = s_backup.led_mode; break;
                     case MI_AVG:      cfg.avg_code = s_backup.avg_code;
-                                      max30102_set_avg(cfg.avg_code); break;
+                                      max30102_set_avg(cfg.avg_code);
+                                      ppg_rate_changed(); break;
                     case MI_CAL:      cfg.spo2_cal = s_backup.spo2_cal; break;
                     case MI_CONTRAST: cfg.contrast = s_backup.contrast;
                                       ssd1306_contrast(cfg.contrast); break;

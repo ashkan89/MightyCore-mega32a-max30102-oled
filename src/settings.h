@@ -8,9 +8,16 @@
 #define LED_MODE_MED  2
 #define LED_MODE_HIGH 3
 
+/* Cached start-up channel-probe verdict.  0xFF means "never established",
+ * which is what a virgin EEPROM, a factory reset, or a swapped sensor
+ * leaves behind and what makes the probe run again. */
+#define PROBE_UNKNOWN 0xFF
+
+#define SETTINGS_VERSION 4
+
 typedef struct {
     uint8_t magic;      /* 0xA5                                     */
-    uint8_t version;    /* 3                                        */
+    uint8_t version;    /* SETTINGS_VERSION                         */
     uint8_t contrast;   /* OLED contrast 0..255                     */
     uint8_t flip;       /* 180 deg rotation                         */
     uint8_t beep;       /* beat beep (needs USE_BUZZER)             */
@@ -21,6 +28,15 @@ typedef struct {
     uint16_t sleep_s;   /* deep sleep after N s with no finger, 0=off*/
     uint8_t start_scr;  /* screen shown at power-up                 */
     uint16_t fs_cal;    /* measured ADC output rate x100, 0=unknown */
+    /* Which averaging setting fs_cal was measured at.  The FIFO output
+     * rate is 400 Hz / 2^avg_code, so a rate learned at one averaging
+     * setting is wrong by up to 32x at another -- and beats are timed by
+     * counting samples, so that error lands straight on the BPM.  Storing
+     * it lets settings_load() throw the calibration away instead of
+     * trusting it.  See ppg_init(). */
+    uint8_t fs_cal_avg;
+    uint8_t probe_v;    /* cached channel-probe verdict, PROBE_UNKNOWN  */
+    uint8_t probe_id;   /* PART_ID the verdict was established against  */
     uint8_t crc;
 } settings_t;
 

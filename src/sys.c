@@ -4,6 +4,90 @@
 
 static volatile uint32_t g_ms;
 
+/* ------------------------------------------------------------------
+ *  Reset cause and stack high-water mark
+ * ------------------------------------------------------------------ */
+uint8_t sys_mcucsr __attribute__((section(".noinit")));
+
+char sys_reset_cause_ch(void)
+{
+    /* Checked most-serious-first: a watchdog reset alongside a power-on
+     * flag means the watchdog fired, and that is the one worth knowing
+     * about.  Several flags can be set at once because they are only
+     * cleared by software. */
+    if (sys_mcucsr & (1 << WDRF))  return 'W';   /* watchdog          */
+    if (sys_mcucsr & (1 << BORF))  return 'B';   /* brown-out         */
+    if (sys_mcucsr & (1 << EXTRF)) return 'E';   /* external / reset  */
+    if (sys_mcucsr & (1 << PORF))  return 'P';   /* power-on          */
+    return '?';
+}
+
+#if STACK_GUARD
+
+/* The paint byte.  0xC5 is not 0x00 or 0xFF, so it cannot be confused
+ * with erased RAM or with a cleared .bss, and it is not a plausible
+ * return address byte either. */
+#define STACK_PAINT 0xC5
+
+extern uint8_t _end;          /* first byte past .bss, from the linker */
+
+/* Runs from .init1, which is the earliest useful point: before
+ * __do_copy_data and __do_clear_bss in .init4, so neither can undo the
+ * paint, and before any C code has run, so the whole region above .bss is
+ * genuinely unused.  Naked, because a prologue would itself push onto the
+ * region being painted.
+ *
+ * The upper bound is the LINKER's __stack (RAMEND), not the stack
+ * pointer.  That distinction matters and is not cosmetic: .init1 runs
+ * before .init2, which is where avr-libc loads SP from __stack, and SP
+ * resets to 0x0000 on this part.  Reading SP here therefore yields 0, and
+ * a loop bounded by "SP minus a guard" would run from _end upwards
+ * through 0xFFF8 -- straight over the whole of SRAM and the I/O register
+ * file.  Using the symbol makes the bound a compile-time constant that
+ * cannot depend on machine state this early.
+ *
+ * Painting through RAMEND itself is harmless: .init2 sets SP = RAMEND and
+ * the first push decrements before storing, and in any case
+ * sys_stack_free() counts upward from _end and never looks at the top.
+ *
+ * Registers: r24 and X/Z only.  Nothing is initialised yet -- r1 is not
+ * cleared until .init2 -- so nothing may be assumed about any register,
+ * and in particular r1 is left untouched.  */
+void sys_stack_paint(void) __attribute__((naked, used, section(".init1")));
+void sys_stack_paint(void)
+{
+    __asm__ volatile (
+        "    ldi  r26, lo8(%1)      \n"   /* X = RAMEND + 1, the limit  */
+        "    ldi  r27, hi8(%1)      \n"
+        "    ldi  r30, lo8(%0)      \n"   /* Z = &_end, first free byte */
+        "    ldi  r31, hi8(%0)      \n"
+        "    ldi  r24, %2           \n"   /* the paint byte             */
+        "1:  st   Z+, r24           \n"
+        "    cp   r30, r26          \n"
+        "    cpc  r31, r27          \n"
+        "    brlo 1b                \n"   /* while Z < limit            */
+        :: "i" (&_end), "i" (RAMEND + 1), "M" (STACK_PAINT)
+        : "r24", "r26", "r27", "r30", "r31"
+    );
+}
+
+uint16_t sys_stack_free(void)
+{
+    const uint8_t *p = &_end;
+    uint16_t n = 0;
+    /* Count the paint still standing from the bottom up.  The first byte
+     * that is not paint is as deep as the stack has ever been.  A false
+     * positive is possible in principle -- a live stack byte that happens
+     * to equal the paint value -- but it can only ever make the answer
+     * look worse than it is, which is the safe direction. */
+    while (p < (const uint8_t *)RAMEND && *p == STACK_PAINT) { p++; n++; }
+    return n;
+}
+
+#else
+uint16_t sys_stack_free(void) { return 0xFFFF; }
+#endif
+
 /* ---- button state machine (runs inside the 1 ms tick) ---- */
 static volatile uint8_t  g_btn_stable;      /* 1 = pressed */
 static uint8_t  s_raw_prev, s_deb_cnt;

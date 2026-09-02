@@ -1,4 +1,10 @@
-/* i2c.h -- hardware TWI master for ATmega32 (SCL=PC0, SDA=PC1), 400 kHz */
+/* i2c.h -- hardware TWI master for ATmega32 (SCL=PC0, SDA=PC1)
+ *
+ * Runs at 100 kHz by default, not 400: these breakout modules are
+ * routinely marginal at 400 kHz over jumper wires, and the escalation
+ * path in max30102.c drops to 100 kHz anyway after twenty consecutive
+ * failures.  Starting there costs a little bus time and removes a whole
+ * class of intermittent fault.  See i2c_set_speed_khz(). */
 #ifndef I2C_H
 #define I2C_H
 #include "config.h"

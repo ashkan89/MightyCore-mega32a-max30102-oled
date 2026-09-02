@@ -62,8 +62,98 @@ void dbg_init(void)
     UCSRA = (1 << U2X);
     UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);   /* 8N1 */
     UCSRB = (1 << TXEN);
-    tx_P(PSTR("\r\n" FW_NAME " " FW_VERSION " diag\r\n"));
+
+#if DBG_MODE == 2
+    /* A column header, so a capture opens straight in a spreadsheet
+     * without anyone having to remember the field order.  Emitted once,
+     * before anything else; every later line is data.  Field meanings are
+     * in the README under "Capturing data". */
+    tx_P(PSTR("\r\nt_ms,code,ibi_ms,bpm_inst_x10,bpm_x10,amp,"
+              "spo2_x10,r_x1000,pi_x100,corr,sqi,fgr,valid,rail,"
+              "dc_ir,dc_red,base_ir,ac_ir,ac_red,fac_ir,fac_red,"
+              "sps,fs_x100,beats,rej,ovf,i2c_err,stuck,stack_free\r\n"));
+#else
+    /* The reset cause goes out first, before anything can fail and
+     * distract from it.  A board that has been up for days and quietly
+     * rebooted is otherwise indistinguishable from one just plugged in --
+     * and 'W' here is the difference between "the watchdog is saving us
+     * repeatedly" and "nothing is wrong". */
+    tx_P(PSTR("\r\n" FW_NAME " " FW_VERSION " diag rst="));
+    tx(sys_reset_cause_ch());
+    tx_P(PSTR("\r\n"));
+#endif
 }
+
+/* Ok Short Long Acq Cont Weak -- see the BEAT_* enum in dbg.h */
+static const char why[] PROGMEM = "OSLACW";
+
+static char why_ch(uint8_t code)
+{
+    return (char)pgm_read_byte(&why[(code < 6) ? code : 5]);
+}
+
+#if DBG_MODE == 2
+
+/* ",value" -- the separator travels with the value, so a record is one
+ * statement per column and the columns cannot drift out of step with the
+ * header emitted in dbg_init(). */
+static void c_u32(uint32_t v) { tx(','); tx_u32(v); }
+
+/* One CSV record per crossing, accepted or not.
+ *
+ * Per-crossing rather than per-sample, deliberately.  A per-sample stream
+ * of this many fields is about 7 kB/s at the ~120 Hz this board runs,
+ * which does not fit in 38400 baud (3.8 kB/s) -- and if the baud rate were
+ * raised to carry it, the main loop would spend most of its time blocked
+ * inside tx(), perturbing the very sample timing the capture exists to
+ * measure.  Two records a second carry every field needed to relate a beat
+ * to the signal that produced it, at under 10 % of the link and no
+ * measurable effect on FIFO servicing.  README, "Capturing data", covers
+ * the raw-sample alternative and what it costs.
+ *
+ * Rejected crossings are included, with their reason code, because the
+ * datasets worth capturing are the ones where beats are NOT being
+ * accepted. */
+void dbg_beat(uint16_t ibi_ms, uint16_t amp, uint8_t code)
+{
+    tx_u32(millis());
+    tx(',');
+    tx(why_ch(code));
+    c_u32(ibi_ms);
+    /* The rate this one interval implies, next to the median-filtered
+     * figure the display shows.  The gap between the two is exactly what
+     * the outlier rejection is doing, and it is not visible any other
+     * way. */
+    c_u32(ibi_ms ? (600000UL / ibi_ms) : 0UL);
+    c_u32(ppg.bpm_x10);
+    c_u32(amp);
+    c_u32(ppg.spo2_x10);
+    c_u32(((uint32_t)ppg.r_q12 * 1000UL) >> 12);
+    c_u32(ppg.pi_x100);
+    c_u32(ppg.corr_x100);
+    c_u32(ppg.sqi);
+    c_u32(ppg.finger);
+    c_u32(ppg.valid);
+    c_u32(ppg.spo2_rail);
+    c_u32(ppg.dc_ir);
+    c_u32(ppg.dc_red);
+    c_u32(ppg.base_ir);
+    c_u32(ppg.ac_ir);
+    c_u32(ppg.ac_red);
+    c_u32(ppg.fac_ir);
+    c_u32(ppg.fac_red);
+    c_u32(ppg.sps);
+    c_u32(ppg.fs_x100);
+    c_u32(ppg.beats);
+    c_u32(ppg.rejects);
+    c_u32(max30102_last_ovf());
+    c_u32(max30102_errors());
+    c_u32(i2c_stuck_count());
+    c_u32(sys_stack_free());
+    tx_P(PSTR("\r\n"));
+}
+
+#else
 
 /* One line per crossing: the interval, the pulse amplitude that produced
  * it, and the reason code.  This is what distinguishes the three failure
@@ -72,15 +162,16 @@ void dbg_init(void)
  * multiples of the true one), and noise (no pattern at all). */
 void dbg_beat(uint16_t ibi_ms, uint16_t amp, uint8_t code)
 {
-    static const char why[] PROGMEM = "OSLACW";  /* Ok Short Long Acq Cont Weak */
     tx_P(PSTR("B ibi="));
     tx_u32(ibi_ms);
     tx_P(PSTR(" amp="));
     tx_u32(amp);
     tx_P(PSTR(" r="));
-    tx((char)pgm_read_byte(&why[(code < 6) ? code : 5]));
+    tx(why_ch(code));
     tx_P(PSTR("\r\n"));
 }
+
+#endif
 
 /* ------------------------------------------------------------------
  *  Channel identification probe
@@ -212,6 +303,13 @@ uint8_t dbg_channel_probe(void)
     return verdict;
 }
 
+#if DBG_MODE == 2 || !DBG_STATUS
+/* Nothing periodic here.  In CSV mode a status line every 2 s would land
+ * in the middle of the records and stop the capture being a valid CSV
+ * file; with DBG_STATUS off it is compiled out to buy flash. */
+void dbg_service(void) { }
+#else
+
 void dbg_service(void)
 {
     static uint32_t next_ms, loop_mark;
@@ -296,7 +394,31 @@ void dbg_service(void)
     f_hex(PSTR("tw"),   i2c_last_status());
     f_dec(PSTR("stg"),  i2c_last_stage());
     f_dec(PSTR("ln"),   (uint32_t)(lines & 3));  /* 3 = both idle high     */
+    /* OVF_COUNTER exactly as it last read, before the cross-check in
+     * max30102_fifo_count() decides whether to believe it.  On a part that
+     * behaves as the datasheet describes this is 0 except just after a real
+     * overflow.  If it instead sits at 31 while sps is healthy and the FIFO
+     * is draining normally, this board is the one the old driver comment
+     * described and the cross-check is what is keeping the sample time base
+     * honest -- worth knowing, and it costs two characters. */
+    f_dec(PSTR("ovf"),  max30102_last_ovf());
+
+    /* --- health of the firmware itself, rather than of the sensor --- */
+    /* Bytes of stack paint still standing: the real margin between the
+     * stack and .bss.  A static estimate cannot see interrupt frames or
+     * what the optimiser did to them, so this is the only trustworthy
+     * figure.  It should settle within the first minute and then never
+     * move; one that keeps falling over hours is something recursing or
+     * leaking, and 0 means the stack has already reached .bss and the
+     * corruption has happened. */
+    f_dec(PSTR("stack"), sys_stack_free());
+    /* Why the board last restarted: P power-on, E external, B brown-out,
+     * W watchdog.  Without it a board that has been up for days and
+     * quietly rebooted looks exactly like one just plugged in. */
+    tx_P(PSTR(" rst="));
+    tx(sys_reset_cause_ch());
     tx_P(PSTR("\r\n"));
 }
+#endif
 
 #endif /* DBG_UART */

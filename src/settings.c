@@ -21,7 +21,7 @@ static uint8_t crc8(const uint8_t *p, uint8_t n)
 void settings_defaults(void)
 {
     cfg.magic     = 0xA5;
-    cfg.version   = 3;
+    cfg.version   = SETTINGS_VERSION;
     cfg.contrast  = 0xCF;
     cfg.flip      = 0;
     cfg.beep      = 0;
@@ -32,17 +32,23 @@ void settings_defaults(void)
     cfg.sleep_s   = 120;
     cfg.start_scr = 0;
     cfg.fs_cal    = 0;          /* learn it on the first run */
+    cfg.fs_cal_avg = 0xFF;      /* ... at an unknown averaging setting */
+    cfg.probe_v   = PROBE_UNKNOWN;   /* so the channel probe runs once */
+    cfg.probe_id  = 0;
 }
 
 void settings_load(void)
 {
     eeprom_read_block(&cfg, &ee_cfg, sizeof(cfg));
-    if (cfg.magic != 0xA5 || cfg.version != 3 ||
+    if (cfg.magic != 0xA5 || cfg.version != SETTINGS_VERSION ||
         cfg.crc != crc8((const uint8_t *)&cfg, (uint8_t)(sizeof(cfg) - 1))) {
         settings_defaults();
         settings_save();
     }
-    if (cfg.avg_code > 5)  cfg.avg_code = 2;
+    /* Anything above MAX_AVG_MAX cannot be paired with an ADC rate that
+     * keeps the output at 100 Hz, so it is not offered -- and a record
+     * written by an older firmware may well hold one. */
+    if (cfg.avg_code > MAX_AVG_MAX) cfg.avg_code = 2;
     if (cfg.led_mode > 3)  cfg.led_mode = LED_MODE_AUTO;
     if (cfg.spo2_cal > 50) cfg.spo2_cal = 50;
     if (cfg.spo2_cal < -50) cfg.spo2_cal = -50;
@@ -50,12 +56,15 @@ void settings_load(void)
     /* A stored rate outside the plausible span means a corrupt or foreign
      * record; fall back to learning it again. */
     if (cfg.fs_cal && (cfg.fs_cal < 3000 || cfg.fs_cal > 60000)) cfg.fs_cal = 0;
+    /* ... and so does a rate measured at a different averaging setting,
+     * which would otherwise be off by up to 32x.  See settings_t. */
+    if (cfg.fs_cal && cfg.fs_cal_avg != cfg.avg_code) cfg.fs_cal = 0;
 }
 
 void settings_save(void)
 {
     cfg.magic   = 0xA5;
-    cfg.version = 3;
+    cfg.version = SETTINGS_VERSION;
     cfg.crc     = crc8((const uint8_t *)&cfg, (uint8_t)(sizeof(cfg) - 1));
     eeprom_update_block(&cfg, &ee_cfg, sizeof(cfg));
 }

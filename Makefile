@@ -19,8 +19,12 @@ OBJCOPY  = avr-objcopy
 SIZE     = avr-size
 AVRDUDE  = avrdude
 
+# Kept in step with [common] build_flags in platformio.ini, which is the
+# canonical set.  If you change one, change the other.
 CFLAGS   = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -Os -std=gnu99 \
-           -Wall -Wextra -Wundef -Werror=implicit-function-declaration \
+           -Wall -Wextra -Wundef -Wshadow -Wpointer-arith -Wcast-align \
+           -Wstrict-prototypes -Wmissing-prototypes -Wredundant-decls \
+           -Werror=implicit-function-declaration \
            -funsigned-char -funsigned-bitfields -fpack-struct -fshort-enums \
            -ffunction-sections -fdata-sections -flto -MMD -MP
 LDFLAGS  = -mmcu=$(MCU) -Wl,--gc-sections -Wl,-Map,$(TARGET).map -flto -Os
@@ -42,6 +46,18 @@ $(TARGET).eep: $(TARGET).elf
 
 size: $(TARGET).elf
 	@$(SIZE) --format=avr --mcu=$(MCU) $<
+	@echo
+	@echo "NOTE: avr-size measures against the bare 32 KB / 2 KB, so it does"
+	@echo "NOT warn about growing over the urboot bootloader at the top of"
+	@echo "flash, nor about leaving too little SRAM for the stack.  The"
+	@echo "PlatformIO build enforces both -- see scripts/check_size.py."
+	@echo "This Makefile builds the equivalent of env:probe (diagnostics and"
+	@echo "the channel probe both on), which is the largest configuration."
+
+# Host-side checks.  math_check.py needs only Python.  tests/host/test_ppg.c
+# needs a host C compiler; see tests/host/run.ps1.
+test:
+	python tests/math_check.py
 
 flash: $(TARGET).hex
 	$(AVRDUDE) -c $(PROG) -p m32 -P $(PORT) -b $(BAUD) -U flash:w:$<:i
@@ -69,5 +85,5 @@ fuses:
 clean:
 	rm -f $(OBJ) $(DEP) $(TARGET).elf $(TARGET).hex $(TARGET).eep $(TARGET).map
 
-.PHONY: all size flash upload verify fuses clean
+.PHONY: all size test flash upload verify fuses clean
 -include $(DEP)

@@ -14,7 +14,15 @@ uint8_t ppg_wave_head;
  * Signal chain (all fixed point, O(1) memory):
  *
  *   raw --> DC tracker (1-pole HP, 0.25 Hz) --> HP2 (1-pole, 0.5 Hz)
- *       --> LP x2 (5 Hz)  --> band-limited PPG  f
+ *       --> LP x2 (1-pole each, 2.4 Hz) --> band-limited PPG  f
+ *
+ * Corner frequencies are for the 100 Hz FIFO output rate the driver
+ * holds; the shifts that set them are below.  The low-pass was described
+ * here as 5 Hz, which never matched LP_SHIFT -- two cascaded sections at
+ * 1/8 put it at fs/(2*pi*8) = 2.4 Hz.  2.4 Hz costs about 6 dB at a
+ * 3 Hz (180 bpm) fundamental, which the zero-crossing detector does not
+ * care about, and it is what keeps the dicrotic notch from crossing back
+ * over zero and being counted as a second beat.
  *
  * Both channels get the identical filter, so the red/IR amplitude ratio
  * that SpO2 depends on is preserved exactly while baseline wander from
@@ -27,10 +35,37 @@ uint8_t ppg_wave_head;
  * only to reject noise.  The peak/trough envelope is still tracked, but now
  * only to normalise the waveform for the display.
  * ------------------------------------------------------------------ */
+/* ---- filter corners ----
+ *
+ * Every filter here is a 1-pole IIR of the form  y += (x - y) >> k,  whose
+ * corner sits at  fc = fs / (2*pi * 2^k).  A shift therefore only fixes a
+ * corner FREQUENCY once the sample rate is known, so these constants are
+ * only correct while the FIFO output rate stays put -- and it now does.
+ *
+ * It did not used to.  The Averaging menu wrote SMP_AVE without touching
+ * SPO2_SR, so it divided the 400 Hz ADC rate down: 1x gave 400 Hz, 32x
+ * gave 12.5 Hz, a range of 32.  Every corner above moved with it instead
+ * of staying put.  At 1x averaging the high-pass corner landed at 2 Hz,
+ * above the heart-rate fundamental, so the pulse was largely filtered
+ * away and beats stopped being detected; at 32x the low-pass corner fell
+ * to 0.3 Hz and removed it from the other side.  Either way the device
+ * looked broken while the sensor and the bus were both healthy, and the
+ * only clue was that someone had touched a settings menu.
+ *
+ * max30102_set_avg() now compensates SPO2_SR so the FIFO output rate is
+ * 100 Hz for every selectable averaging setting -- see the note there,
+ * which is also why the choice is limited to 1x/2x/4x.  Averaging
+ * consequently means what a user expects it to mean, "how much on-chip
+ * noise averaging", and no longer doubles as a hidden sample-rate
+ * control.  These corners are the ones that rate was tuned for:
+ */
 #define DC_SHIFT        6       /* DC tracker, ~0.25 Hz corner              */
 #define HP2_SHIFT       5       /* second high-pass, ~0.5 Hz corner         */
 #define LP_SHIFT        3       /* two cascaded 1-pole LPs, ~2.4 Hz corner  */
 #define ENV_DECAY       8       /* peak/trough envelope decay, ~2.6 s       */
+#define SETTLE_SAMPLES 40       /* samples discarded after an AGC step      */
+#define BASE_LEAK      500      /* idle-tracker leak interval, ~5 s         */
+
 #define AMP_FLOOR      60       /* display normalisation floor              */
 #define AMP_MIN_BEAT   25       /* below this the trace is treated as noise */
 #define LOST_RESYNC     4       /* lose this many samples -> drop the beat   */
@@ -40,8 +75,14 @@ uint8_t ppg_wave_head;
 #define REFRAC_MAX    700       /* never blank longer than this             */
 #define IBI_HIST       12
 #define R_HIST          8
-#define SETTLE_SAMPLES 40       /* samples discarded after an AGC step      */
 #define LOCK_BEATS      4       /* beats before a reading is published      */
+/* A published SpO2 goes stale if no beat window produces a usable ratio
+ * for this long.  spo2_update() has several legitimate early returns (AC
+ * too small, correlation gate, window too short) and none of them used to
+ * clear the last value, so a reading taken from one good beat stayed on
+ * the display indefinitely as long as beats kept arriving -- presented as
+ * current when nothing was measuring it any more. */
+#define SPO2_STALE_MS 6000UL
 
 /* Largest R the SpO2 curve is still calibrated for, in Q8.  295/256 = 1.152,
  * which is where the polynomial passes 70 % -- the bottom of Maxim's table
@@ -91,7 +132,7 @@ uint8_t ppg_wave_head;
 #define RESP_LP_SHIFT   6
 #define RESP_HP_SHIFT   9
 #define RESP_ENV_SHIFT  9
-#define RESP_WIN     3000       /* samples (30 s at 100 Hz)                 */
+#define RESP_WIN     3000       /* samples (25 s at the measured ~120 Hz)   */
 #define RESP_FLOOR_DIV 4000     /* modulation below DC/4000 is not breathing*/
 
 /* Finger detection.
@@ -179,15 +220,36 @@ typedef struct {
 
     uint32_t base_dc;               /* learned no-finger reflection level */
     uint16_t base_cnt;
+    /* Accepted and rejected crossings for THIS measurement only.
+     * ppg.beats / ppg.rejects are session totals and are what the
+     * analysis screen shows, but SQI must not be computed from them: they
+     * survive a finger being lifted and replaced, so a fresh measurement
+     * inherited the reject ratio of the previous one and showed two bars
+     * on a signal that deserved five.  Reset with the measurement. */
+    uint16_t m_ok, m_rej;
     uint8_t  finger_cnt;
     uint8_t  no_arm;                /* block re-latching until DC falls back */
     uint32_t agc_ms, temp_ms, fs_ms, sps_ms;
+    uint32_t spo2_ms;               /* last SpO2 actually published */
     uint32_t fs_t0;                 /* origin of the sample-rate baseline  */
     uint8_t  fs_saved;              /* rate already written to EEPROM      */
     uint32_t fs_nmark, sps_mark;
 } ppg_priv_t;
 
 static ppg_priv_t s;
+
+/* Called when the averaging setting changes.  max30102_set_avg() holds the
+ * output rate at 100 Hz across the settings it allows, so the filters do
+ * not move -- but the measured rate calibration was taken before the
+ * change and the FIFO was flushed, so the estimator is restarted rather
+ * than left to average across the discontinuity. */
+void ppg_rate_changed(void)
+{
+    s.fs_saved = 0;
+    s.fs_t0    = millis();
+    s.fs_nmark = s.nsamp;
+    ppg_reset_measure();
+}
 
 /* ------------------------------------------------------------------ */
 static uint8_t led_fixed_pa(void)
@@ -219,6 +281,8 @@ void ppg_reset_measure(void)
     s.r_above = 0;
     s.r_env = 0;
     s.base_cnt = 0;
+    s.spo2_ms  = millis();
+    s.m_ok = s.m_rej = 0;
 
     ppg.valid     = 0;
     ppg.progress  = 0;
@@ -255,11 +319,19 @@ void ppg_init(void)
     memset(&s, 0, sizeof(s));
     memset(&ppg, 0, sizeof(ppg));
     /* Start from the rate this module was measured at last time rather than
-     * the nominal 100 Hz.  The MAX30102 oscillator is only good to a few
+     * the nominal rate.  The MAX30102 oscillator is only good to a few
      * percent and this board runs about 120 Hz where 100 is nominal -- a
      * 20 % error straight onto the BPM figure for the twenty-odd seconds the
-     * live estimator needs to converge, which is most of a spot measurement. */
-    ppg.fs_x100 = cfg.fs_cal ? cfg.fs_cal : (uint16_t)(PPG_FS_NOM * 100u);
+     * live estimator needs to converge, which is most of a spot measurement.
+     *
+     * The fallback is the rate the CURRENT averaging setting implies
+     * (400 Hz / 2^avg_code), not a hard-coded 100 Hz: settings_load()
+     * discards a calibration that was measured at a different averaging
+     * setting, and 100 Hz would then be wrong by the same factor the
+     * calibration was. */
+    ppg.fs_x100 = cfg.fs_cal ? cfg.fs_cal
+                             : (uint16_t)(40000UL >> ((cfg.avg_code > 5)
+                                                      ? 2 : cfg.avg_code));
     ppg.led_ir  = led_fixed_pa();
     ppg.led_red = ppg.led_ir;
     ppg.temp_x10 = -999;
@@ -302,9 +374,12 @@ static void sqi_update(void)
         int16_t rel = (int16_t)(((uint32_t)ppg.sdnn_ms * 100u) / ppg.ibi_ms);
         if (rel > 6) q -= (int16_t)((rel - 6) * 2);
     }
-    if (ppg.beats + ppg.rejects > 8) {
-        uint16_t rr = (uint16_t)((ppg.rejects * 100u) / (ppg.beats + ppg.rejects));
-        q -= (int16_t)rr;
+    /* Rejected crossings as a fraction of all crossings in this
+     * measurement.  Saturating counters, so a long session cannot
+     * overflow them and cannot let ancient history dominate either. */
+    if ((uint16_t)(s.m_ok + s.m_rej) > 8) {
+        uint16_t tot = (uint16_t)(s.m_ok + s.m_rej);
+        q -= (int16_t)((uint32_t)s.m_rej * 100UL / tot);
     }
     if (q < 0)   q = 0;
     if (q > 100) q = 100;
@@ -393,7 +468,7 @@ static void spo2_update(void)
     {
         uint16_t med = median_u16(s.rq12, s.r_n);
         int32_t  r8  = med >> 4;                    /* R in Q8 */
-        int32_t  r2, sp;
+        int32_t  sp;
         ppg.r_q12 = med;
 
         /* The curve below is a fit to Maxim's reference table and is only
@@ -417,24 +492,44 @@ static void spo2_update(void)
         }
         ppg.spo2_rail = 0;
         if (r8 < 0)   r8 = 0;
-        r2 = (r8 * r8) >> 8;
-        /* SpO2 = -45.06*R^2 + 30.354*R + 94.845, evaluated in Q8 */
-        sp = 24280L + ((7771L * r8) >> 8) - ((11535L * r2) >> 8);
+        /* SpO2 = -45.06*R^2 + 30.354*R + 94.845, evaluated in Q8.
+         *
+         * The quadratic term folds both shifts into one: it used to form
+         * r2 = (r8*r8) >> 8 and then shift the product down by 8 again,
+         * and truncating twice made the result sawtooth rather than fall
+         * smoothly -- six places in the trusted range of R where a
+         * LARGER ratio produced a HIGHER saturation, by up to 0.2 %.
+         * Small, but it is the wrong sign, and a slowly drifting R could
+         * walk the display back and forth across a whole percent.
+         *
+         * One shift of 16 is the same amount of work, is monotonic
+         * throughout, and halves the error against the polynomial
+         * (1.58 -> 1.03 tenths of a percent worst case, measured by
+         * tests/math_check.py).  r8 is bounded by R_TRUST_MAX = 295
+         * above, so the intermediate reaches 11535 * 295^2 = 1.0e9 and
+         * has better than 2x headroom in an int32. */
+        sp = 24280L + ((7771L * r8) >> 8) - ((11535L * r8 * r8) >> 16);
         sp = (sp * 10) >> 8;                        /* -> tenths of a % */
         sp += cfg.spo2_cal;
         if (sp > 1000) sp = 1000;
         if (sp < 700)  sp = 700;
         ppg.spo2_x10 = (uint16_t)sp;
+        s.spo2_ms    = millis();        /* for the staleness check below */
         if (!ppg.spo2_min_x10 || ppg.spo2_x10 < ppg.spo2_min_x10)
             ppg.spo2_min_x10 = ppg.spo2_x10;
     }
 }
 
 /* ---------------- one accepted beat ---------------- */
+/* Saturating increment: 16 bits is far more crossings than a measurement
+ * ever sees, but a counter that wraps would invert the quality figure. */
+static void bump(uint16_t *c) { if (*c < 60000u) (*c)++; }
+
 static void on_beat(uint16_t ibi_ms)
 {
     ppg.ibi_ms  = ibi_ms;
     ppg.beats++;
+    bump(&s.m_ok);
     ppg.beat    = 1;
     ppg.beat_ms = millis();
 
@@ -469,8 +564,21 @@ static void on_beat(uint16_t ibi_ms)
      * is penalised by the reject count, so a spell of rejected crossings
      * dragged it under the threshold and the reading then never appeared --
      * a gate that shuts harder the more it is needed.  SQI is shown to the
-     * user as bars instead, which is what it is good for. */
-    ppg.valid = (uint8_t)(s.ibi_n >= LOCK_BEATS && ppg.spo2_x10 != 0);
+     * user as bars instead, which is what it is good for.
+     *
+     * Nor does it depend on SpO2 any more.  It used to require
+     * spo2_x10 != 0, which withheld a perfectly good HEART RATE whenever
+     * SpO2 was unavailable -- and SpO2 being unavailable is a normal,
+     * expected outcome: a weak RED return fails the correlation gate, and
+     * an R outside the curve's domain is reported rather than guessed at.
+     * The consequence was a device that tracked the pulse, drew the
+     * waveform and flashed the beat LED while the header read ACQUIRING
+     * for ever, the HR trend stayed empty and the status LED never left
+     * search.  The two measurements are independent and are now published
+     * independently: this flag means "the pulse rate has converged", and
+     * SpO2 stands or falls on spo2_x10 / spo2_rail, which the display
+     * already renders separately. */
+    ppg.valid = (uint8_t)(s.ibi_n >= LOCK_BEATS);
 }
 
 /* ---------------- respiration, updated every sample ---------------- */
@@ -504,7 +612,13 @@ static void resp_process(uint32_t ir)
     else if (s.r_above && rs < -hyst) { s.r_above = 0; }
 
     if (++s.r_win >= RESP_WIN) {
-        /* breaths per minute = crossings / window_seconds * 60 */
+        /* breaths per minute = crossings / window_seconds * 60, where the
+         * window is RESP_WIN samples and so lasts RESP_WIN/fs seconds --
+         * which is why the measured rate appears in the numerator:
+         *   rr = cross * fs / RESP_WIN * 60 = cross * fs_x100 / 5000
+         * with RESP_WIN = 3000.  A fixed sample count is fine here
+         * BECAUSE of that fs term; the window is 25 s rather than 30 at
+         * this board's ~120 Hz, and the result is correct either way. */
         uint32_t rr = ((uint32_t)s.r_cross * ppg.fs_x100) / 5000UL;
         ppg.resp_bpm = (uint8_t)((s.r_low > (RESP_WIN / 2) || rr > 40 || rr < 4)
                                  ? 0 : rr);
@@ -532,6 +646,7 @@ void ppg_lost_samples(uint8_t n)
     s.t_cross_q8 = 0;
     s.refrac     = 0;
     ppg.rejects++;
+    bump(&s.m_rej);
 }
 
 /* ================= per-sample entry point ================= */
@@ -584,7 +699,7 @@ void ppg_process(uint32_t red, uint32_t ir)
             if (s.base_dc == 0 || refl < s.base_dc) {
                 s.base_dc = refl;
                 s.base_cnt = 0;
-            } else if (++s.base_cnt >= 500) {
+            } else if (++s.base_cnt >= BASE_LEAK) {
                 s.base_cnt = 0;
                 s.base_dc += (s.base_dc >> 5) + 4;
             }
@@ -830,16 +945,22 @@ void ppg_process(uint32_t red, uint32_t ir)
                 if (ibi_ms > (uint16_t)(med + tol) || ibi_ms + tol < med)
                     code = BEAT_CONT;
             }
-            dbg_beat(ibi_ms, (uint16_t)((pp > 65535) ? 65535 : pp), code);
-
             if (code == BEAT_OK) {
                 on_beat(ibi_ms);
             } else {
                 ppg.rejects++;
-                /* Too SHORT means this crossing was noise rather than the
-                 * beat being missed, so keep the last good reference. */
-                if (code == BEAT_SHORT) { s.fprev = f; return; }
+                bump(&s.m_rej);
             }
+            /* Reported AFTER the accept/reject, not before.  The fields
+             * this call takes are unaffected either way, but in CSV mode
+             * it also samples the published measurement -- and taken
+             * beforehand every record described the PREVIOUS beat's
+             * result, which is a whole beat of skew in a dataset whose
+             * only purpose is relating cause to effect. */
+            dbg_beat(ibi_ms, (uint16_t)((pp > 65535) ? 65535 : pp), code);
+            /* Too SHORT means this crossing was noise rather than the
+             * beat being missed, so keep the last good reference. */
+            if (code == BEAT_SHORT) { s.fprev = f; return; }
         }
         s.t_cross_q8 = t_q8;
         s.win_valid  = 0;                           /* start a fresh AC window */
@@ -975,8 +1096,13 @@ void ppg_service(void)
                                         ? (cfg.fs_cal - ppg.fs_x100)
                                         : (ppg.fs_x100 - cfg.fs_cal));
                 s.fs_saved = 1;
-                if (!cfg.fs_cal || d > (ppg.fs_x100 / 50)) {      /* > 2 %  */
-                    cfg.fs_cal = ppg.fs_x100;
+                if (!cfg.fs_cal || cfg.fs_cal_avg != cfg.avg_code
+                                || d > (ppg.fs_x100 / 50)) {      /* > 2 %  */
+                    cfg.fs_cal     = ppg.fs_x100;
+                    /* Stamped with the averaging setting it was measured
+                     * at, so the next boot can tell whether it applies.
+                     * See settings_t.fs_cal_avg. */
+                    cfg.fs_cal_avg = cfg.avg_code;
                     settings_save();
                 }
             }
@@ -991,6 +1117,22 @@ void ppg_service(void)
     if (ppg.valid && (uint32_t)(now - ppg.beat_ms) > 4000) {
         ppg.valid    = 0;
         ppg.progress = 0;
+        /* SQI is only ever recomputed on an accepted beat, so without
+         * this it keeps displaying the quality of a measurement that has
+         * already stopped -- five confident bars next to a dashed-out
+         * reading. */
+        ppg.sqi      = 0;
+    }
+
+    /* Drop a stale SpO2 independently of the heart rate.  A beat window
+     * can fail to yield a usable ratio for many legitimate reasons while
+     * beats keep being detected normally, and the last published value
+     * used to survive all of them: the display went on asserting a
+     * saturation that nothing had measured for minutes.  Retire it, and
+     * say which way it failed so the monitor screen can explain itself. */
+    if (ppg.spo2_x10 && (uint32_t)(now - s.spo2_ms) > SPO2_STALE_MS) {
+        ppg.spo2_x10 = 0;
+        ppg.r_q12    = 0;
     }
 
     /* Something that produces no pulse at all is not a finger.  The DC test

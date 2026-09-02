@@ -9,11 +9,13 @@
  *
  *    - every transaction reports success/failure and is retried
  *    - failures are counted and escalated (recover, slow down, give up)
- *    - the FIFO is tracked by its pointers only; see max30102_fifo_count()
- *      for why the overflow counter cannot be trusted on this module
+ *    - the FIFO pointers and the overflow counter are read in a single
+ *      burst and cross-checked against each other; see
+ *      max30102_fifo_count()
  * ------------------------------------------------------------------ */
 #include "max30102.h"
 #include "i2c.h"
+#include "sys.h"
 #include <util/delay.h>
 #include <avr/wdt.h>
 
@@ -34,12 +36,23 @@
 #define PULSEWIDTH_MASK   0xFC
 #define PULSEWIDTH_411    0x03
 
+/* SPO2_SR[2:0] lives in bits 4:2 of SPO2_CFG.  Datasheet Table 6:
+ *   001 = 100 Hz   010 = 200 Hz   011 = 400 Hz
+ * so the field VALUE for the rate we want is (avg_code + 1) and it is
+ * placed by shifting left 2.  See sr_field_for_avg(). */
+#define SR_FIELD(v)       (uint8_t)((v) << 2)
+
 #define SLOT1_MASK        0xF8
 #define SLOT2_MASK        0x8F
 #define SLOT_RED_LED      0x01
 #define SLOT_IR_LED       0x02
 
 #define I2C_RETRIES       3
+
+/* millis() of the last moment the part's OVF_COUNTER is known to have
+ * been cleared -- a successful FIFO drain, or a pointer flush.  See the
+ * long note above max30102_fifo_count() for what it is used for. */
+static uint32_t s_drain_ms;
 
 static uint8_t  s_part, s_rev, s_present, s_acked;
 static uint16_t s_err;
@@ -99,6 +112,25 @@ static uint8_t reg_read(uint8_t reg, uint8_t *val)
     return 0;
 }
 
+/* Same, for a run of consecutive registers in ONE transaction.
+ *
+ * The datasheet is explicit that this works: "When reading the MAX30102
+ * registers in one burst-read I2C transaction, the register address
+ * pointer typically increments so that the next byte of data sent is from
+ * the next register... The exception to this is the FIFO data register,
+ * register 0x07."  So every register except 0x07 can be swept in one go.
+ */
+static uint8_t reg_read_n(uint8_t reg, uint8_t *buf, uint8_t n)
+{
+    uint8_t t;
+    for (t = 0; t < I2C_RETRIES; t++) {
+        if (i2c_reg_rn(MAX30102_ADDR, reg, buf, n) == I2C_OK) return 1;
+        wdt_reset();
+        _delay_us(200);
+    }
+    return 0;
+}
+
 /* writeRegister8: address + value, terminated with a STOP. */
 static uint8_t reg_write(uint8_t reg, uint8_t val)
 {
@@ -133,6 +165,11 @@ void max30102_flush_fifo(void)           /* clearFIFO */
     reg_write(REG_FIFO_WR,  0x00);
     reg_write(REG_FIFO_OVF, 0x00);
     reg_write(REG_FIFO_RD,  0x00);
+    /* The overflow counter has just been zeroed by hand, so the same
+     * reasoning applies as after a drain: anything reported from here is
+     * loss that happened afterwards.  Without this, a flush during
+     * bring-up left the gate open on a stale count. */
+    s_drain_ms = millis();
 }
 
 /* FIFO_CFG written whole rather than read-modify-write.  The reference uses
@@ -146,12 +183,50 @@ static uint8_t write_fifo_cfg(void)
                      (uint8_t)((s_avg_code << 5) | ROLLOVER_ENABLE));
 }
 
-void max30102_set_avg(uint8_t avg_code)  /* setFIFOAverage */
+/* ---- averaging, and why it also writes the sample rate ----
+ *
+ * SMP_AVE averages adjacent ADC samples on the chip and pushes one
+ * result into the FIFO, so it DIVIDES the FIFO output rate: at the
+ * 400 Hz ADC rate this driver configures, 1x averaging gives 400 Hz out
+ * and 32x gives 12.5 Hz.  This function used to write SMP_AVE alone,
+ * which made the Averaging menu a hidden sample-rate control spanning a
+ * factor of 32 -- and every DSP filter corner in ppg.c is a fixed shift
+ * that is only correct at one rate, so selecting anything but the default
+ * silently moved the passband off the heart rate.  See the notes above
+ * DC_SHIFT in ppg.c for what that looked like.
+ *
+ * The fix is to compensate with SPO2_SR so the output rate is 100 Hz
+ * whatever the averaging is:
+ *
+ *     avg 1x  ->  SPO2_SR = 100 Hz   ->  100 / 1  = 100 Hz out
+ *     avg 2x  ->  SPO2_SR = 200 Hz   ->  200 / 2  = 100 Hz out
+ *     avg 4x  ->  SPO2_SR = 400 Hz   ->  400 / 4  = 100 Hz out
+ *
+ * which is why MAX_AVG_MAX is 2 (4x) and not 5 (32x): 8x averaging would
+ * need an 800 Hz ADC rate, and datasheet Table 11, "SpO2 Mode (Allowed
+ * Settings)", does not permit 800 Hz at the 411 us pulse width this
+ * driver uses -- 400 Hz is the highest allowed there.  Writing 800
+ * anyway would not fail cleanly either: the datasheet says the part
+ * silently programs "the highest possible sample rate" instead, so the
+ * register would read back 400 and the output rate would halve without
+ * anything reporting it.
+ *
+ * The averaging setting therefore now means only what its name says --
+ * how much on-chip noise averaging is applied -- and trades resolution
+ * against nothing else. */
+void max30102_set_avg(uint8_t avg_code)  /* setFIFOAverage + matching SR */
 {
-    if (avg_code > 5) avg_code = 5;
+    if (avg_code > MAX_AVG_MAX) avg_code = MAX_AVG_MAX;
     s_avg_code = avg_code;
     write_fifo_cfg();
+    bit_mask(REG_SPO2_CFG, SAMPLERATE_MASK, SR_FIELD(avg_code + 1));
     max30102_flush_fifo();
+}
+
+/* The SPO2_CFG sample-rate field the current averaging setting implies. */
+static uint8_t sr_field_for_avg(void)
+{
+    return SR_FIELD(s_avg_code + 1);
 }
 
 void max30102_shutdown(uint8_t on)
@@ -170,9 +245,9 @@ uint8_t max30102_readback(uint8_t *mode, uint8_t *spo2, uint8_t *fifo)
 
 uint8_t max30102_ptrs(uint8_t *wr, uint8_t *ovf, uint8_t *rd)
 {
-    if (!reg_read(REG_FIFO_WR,  wr))  return 0;
-    if (!reg_read(REG_FIFO_OVF, ovf)) return 0;
-    if (!reg_read(REG_FIFO_RD,  rd))  return 0;
+    uint8_t p[3];
+    if (!reg_read_n(REG_FIFO_WR, p, 3)) return 0;
+    *wr = p[0]; *ovf = p[1]; *rd = p[2];
     return 1;
 }
 
@@ -218,7 +293,11 @@ static void setup_config(void)
     write_fifo_cfg();
     bit_mask(REG_MODE_CFG, MODE_MASK, MODE_REDIRONLY);      /* RED + IR   */
     bit_mask(REG_SPO2_CFG, ADCRANGE_MASK,   ADCRANGE_4096);
-    bit_mask(REG_SPO2_CFG, SAMPLERATE_MASK, SAMPLERATE_400);
+    /* Not a hard-coded 400 Hz: the rate has to match the averaging
+     * setting so the FIFO output rate stays at 100 Hz.  See
+     * max30102_set_avg().  With the default 4x averaging this is exactly
+     * SAMPLERATE_400, so nothing changes for the default build. */
+    bit_mask(REG_SPO2_CFG, SAMPLERATE_MASK, sr_field_for_avg());
     bit_mask(REG_SPO2_CFG, PULSEWIDTH_MASK, PULSEWIDTH_411);
     wdt_reset();
 
@@ -246,9 +325,18 @@ static uint8_t config_landed(void)
     if (!reg_read(REG_MODE_CFG, &mode)) return 0;
     if (!reg_read(REG_SPO2_CFG, &spo2)) return 0;
     if ((mode & 0x07) != MODE_REDIRONLY) return 0;
-    if ((spo2 & 0x1F) != (SAMPLERATE_400 | PULSEWIDTH_411)) return 0;
+    if ((spo2 & 0x1F) != (uint8_t)(sr_field_for_avg() | PULSEWIDTH_411)) return 0;
     return 1;
 }
+
+/* Public wrapper, so the display can render a verdict instead of a
+ * hard-coded list of expected register values.  The monitor screen used to
+ * print "want 03 2F 50" next to the live read-back, which stopped being
+ * true the moment SPO2_CFG's sample-rate field started tracking the
+ * averaging setting -- 4x averaging still wants 0x2F, but 2x wants 0x2B
+ * and 1x wants 0x27.  Asking the driver is correct at every setting, and
+ * smaller than the string it replaces. */
+uint8_t max30102_config_ok(void) { return config_landed(); }
 
 uint8_t max30102_init(void)
 {
@@ -300,40 +388,99 @@ uint8_t max30102_init(void)
 }
 
 /* ---------------- check() ---------------- */
-/* Pointers only.  FIFO_OVF is deliberately NOT consulted: on this module it
- * reads a saturated 0x1F whether or not anything was dropped, and the same
- * registers come up with FIFO_CFG's A_FULL nibble already set, so the low
- * FIFO registers cannot be trusted as a loss signal.  Believing it cost two
- * separate bugs -- reporting a full 32 samples on an empty FIFO (phantom
- * samples that inflated the sample rate and reset the beat detector), and
- * then flushing the FIFO on every poll so no samples arrived at all.
- * SparkFun ignores the counter too; the pointers are what actually work.
+/* How many unread samples the FIFO holds, and how many it dropped.
  *
- * The cost of dropping it is that "empty" and "wrapped completely" look
- * alike.  That is a fair trade: the FIFO holds 320 ms at 100 Hz and it is
- * polled every 4 ms, so a full wrap needs an eighty-fold overrun, and the
- * DSP's own interval continuity check rejects the stale beat if it happens. */
+ * Both come back in ONE I2C transaction now.  FIFO_WR_PTR (0x04),
+ * OVF_COUNTER (0x05) and FIFO_RD_PTR (0x06) are consecutive, and the
+ * datasheet guarantees the register address pointer auto-increments
+ * across a burst read of anything but 0x07 -- so a 3-byte read replaces
+ * the two separate single-register reads this used to do.
+ *
+ * That halves the transaction count on the hottest path in the firmware.
+ * Each register read is an address phase plus a repeated START plus a
+ * data byte, about 600 us at 100 kHz; two of them every FIFO_POLL_MS = 4
+ * ms was around 30 % of all CPU time spent holding the bus, for nothing
+ * but a sample count.  One 3-byte read is about 750 us, so the poll cost
+ * drops by roughly 40 % and the FIFO service latency drops with it.
+ *
+ * ---- the overflow counter ----
+ * This code used to ignore OVF_COUNTER entirely and infer loss from the
+ * pointers alone, on the bench observation that the counter read a
+ * saturated 0x1F whether or not anything had been dropped.  The datasheet
+ * says otherwise, and specifically: "When a complete sample is popped
+ * (i.e. removal of old FIFO data and shifting the samples down) from the
+ * FIFO (when the read pointer advances), OVF_COUNTER is reset to zero."
+ * Since this driver pops samples on nearly every poll, the counter read
+ * here is the loss accumulated since the previous burst -- exactly the
+ * number the DSP's time base needs, and better than the previous guess of
+ * "call it 31".
+ *
+ * Rather than pick a side, the value is cross-checked before it is
+ * believed -- against ELAPSED TIME, not against the pointers.  The
+ * pointers cannot do this job: with FIFO_ROLLOVER_EN set the write
+ * pointer wraps straight past the read pointer, so after a real overflow
+ * the difference between them is (32 + lost) mod 32, which is small for a
+ * small loss and arbitrary for a large one.  A "the FIFO looks full"
+ * test would therefore reject precisely the genuine overflows it was
+ * meant to confirm.
+ *
+ * Time is the honest discriminator.  Samples can only be lost once the
+ * FIFO has filled, and the FIFO holds 32 samples -- 320 ms at the 100 Hz
+ * output rate.  So a loss reported less than OVF_MIN_GAP_MS after the
+ * last successful drain cannot be describing this bus, and is the stuck
+ * counter the old comment recorded.  A loss reported after a real stall
+ * is believed.  Both worlds are handled, and s_ovf_raw publishes the
+ * unfiltered value so which one this board lives in can be read off the
+ * diagnostic line within seconds.
+ *
+ * The pointer-only fallback is kept for the case where the FIFO is found
+ * completely full and the counter reported nothing: that is still a sign
+ * that time passed without samples reaching the DSP.
+ */
+/* 200 ms, comfortably inside the 320 ms the FIFO buffers, so a genuine
+ * overflow is never rejected, while the every-4-ms polling of a healthy
+ * bus can never clear it. */
+#define OVF_MIN_GAP_MS 200
+
+static uint8_t  s_ovf_raw;         /* OVF_COUNTER exactly as it read */
+
+uint8_t max30102_last_ovf(void) { return s_ovf_raw; }
+
 uint8_t max30102_fifo_count(void)
 {
-    uint8_t wr, rd;
+    uint8_t p[3];
+    uint8_t wr, ovf, rd;
     int16_t n;
 
-    if (!reg_read(REG_FIFO_WR, &wr)) return MAX_FIFO_ERR;
-    if (!reg_read(REG_FIFO_RD, &rd)) return MAX_FIFO_ERR;
+    if (!reg_read_n(REG_FIFO_WR, p, 3)) return MAX_FIFO_ERR;
+    wr  = p[0];
+    ovf = p[1];
+    rd  = p[2];
 
-    /* Both pointers are 5-bit fields, so anything above 31 is a corrupt
-     * read, not a pointer.  The bus does drop the occasional byte on this
-     * board -- roughly one read in a thousand -- and a garbled write pointer
-     * produced a bogus count of up to 31, which was reported to the DSP as
-     * lost samples and reset the beat detector for no reason. */
-    if (wr > 31 || rd > 31) return MAX_FIFO_ERR;
+    /* All three are 5-bit fields, so anything above 31 is a corrupt read,
+     * not a pointer.  The bus does drop the occasional byte on this board
+     * -- roughly one read in a thousand -- and a garbled write pointer
+     * produced a bogus count of up to 31, which was reported to the DSP
+     * as lost samples and reset the beat detector for no reason. */
+    if (wr > 31 || rd > 31 || ovf > 31) return MAX_FIFO_ERR;
+
+    s_ovf_raw = ovf;
 
     n = (int16_t)wr - (int16_t)rd;
     if (n < 0) n += 32;
 
-    /* A FIFO found completely full is the one pointer-only sign that time
-     * passed without samples reaching the DSP, so the time base is told. */
-    if (n >= 31) s_ovf = 31;
+    if (ovf && (uint32_t)(millis() - s_drain_ms) >= OVF_MIN_GAP_MS) {
+        /* Believed: enough time passed un-drained for the FIFO to fill.
+         * 31 is the counter's saturation point and means "at least 31,
+         * actual number unknown", so it is reported as the marker rather
+         * than as a count. */
+        s_ovf = (uint8_t)((ovf >= 31) ? MAX_OVF_UNKNOWN : ovf);
+    } else if (n >= 31) {
+        /* The counter said nothing usable, but the FIFO is full, so
+         * samples were still lost.  How many is unknown -- report the
+         * discontinuity, not a made-up count.  See MAX_OVF_UNKNOWN. */
+        s_ovf = MAX_OVF_UNKNOWN;
+    }
 
     return (uint8_t)n;
 }
@@ -386,6 +533,11 @@ uint8_t max30102_read(max_sample_cb cb, uint8_t max_samples)
         if (i2c_read(&b[i], (uint8_t)(i < (k - 1)))) goto fail;
     i2c_stop();
 
+    /* The read pointer has advanced, so the part has cleared
+     * OVF_COUNTER; anything it reports from here is loss that happened
+     * after this moment.  See the note above max30102_fifo_count(). */
+    s_drain_ms = millis();
+
     for (i = 0; i < n; i++) {
         const uint8_t *p = &b[i * 6];
         uint32_t w0 = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -415,6 +567,16 @@ fail:
     s_ovf = n;
     return 0;
 }
+
+/* Marker used when the FIFO is known to have overflowed but the number of
+ * samples lost is not known -- see the fallback in max30102_fifo_count().
+ * It is deliberately small.  Reporting 31 there, as this used to, told the
+ * DSP that a third of a second had passed unobserved every time the FIFO
+ * was found full, and s.nsamp is also the basis of the sample-rate
+ * calibration, so each event skewed the measured rate as well.  What the
+ * DSP actually needs from an unquantified gap is the DISCONTINUITY -- drop
+ * the beat reference, do not time an interval across it -- and any value
+ * at or above LOST_RESYNC achieves that without inflating the time base.  */
 
 /* ---------------- die temperature ---------------- */
 static uint8_t s_temp_busy;

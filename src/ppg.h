@@ -69,6 +69,10 @@ void ppg_reset_session(void);       /* clears session min/max/duration     */
 void ppg_process(uint32_t red, uint32_t ir);   /* one FIFO sample          */
 void ppg_lost_samples(uint8_t n);   /* keeps the sample time base honest   */
 void ppg_service(void);             /* AGC, temperature, fs calibration    */
+/* Call after cfg.avg_code changes.  Re-derives every rate-dependent filter
+ * shift and window length, and discards the sample-rate calibration that
+ * was measured at the old setting. */
+void ppg_rate_changed(void);
 
 /* live waveform ring, filled at fs/2 so 128 px spans about 2.5 s */
 extern int8_t  ppg_wave[WAVE_LEN];
