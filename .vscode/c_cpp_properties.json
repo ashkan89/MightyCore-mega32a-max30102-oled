@@ -1,0 +1,38 @@
+//
+// !!! WARNING !!! AUTO-GENERATED FILE!
+// PLEASE DO NOT MODIFY IT AND USE "platformio.ini":
+// https://docs.platformio.org/page/projectconf/section_env_build.html#build-flags
+//
+{
+    "configurations": [
+        {
+            "name": "PlatformIO",
+            "includePath": [
+                "C:/Users/ashka/Desktop/mega16-max30102/src",
+                ""
+            ],
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true,
+                "path": [
+                    "C:/Users/ashka/Desktop/mega16-max30102/src",
+                    ""
+                ]
+            },
+            "defines": [
+                "F_CPU=16000000UL",
+                "PLATFORMIO=60119",
+                "ARDUINO_AVR_ATmega32",
+                "__AVR_ATmega32__",
+                ""
+            ],
+            "cStandard": "gnu99",
+            "cppStandard": "gnu++11",
+            "compilerPath": "C:/Users/ashka/.platformio/packages/toolchain-atmelavr/bin/avr-gcc.exe",
+            "compilerArgs": [
+                "-mmcu=atmega32",
+                ""
+            ]
+        }
+    ],
+    "version": 4
+}
