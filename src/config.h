@@ -14,7 +14,7 @@
 
 /* ---------------- Firmware identity ---------------- */
 #define FW_NAME     "PulseOx"
-#define FW_VERSION  "1.1.0"
+#define FW_VERSION  "1.1.1"
 
 /* ---------------- Flash and SRAM budget ----------------
  * 32 KB of flash, of which the top BOOTLOADER_RESERVE bytes belong to

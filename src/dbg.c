@@ -372,7 +372,15 @@ void dbg_service(void)
      *                  interference.  It lands on both channels as the same
      *                  ADC counts, and RED has the smaller DC to divide by,
      *                  so it always pushes R up and SpO2 down
-     *   rail=1         R past the curve's domain, so no reading is published
+     *
+     * rail says why the last beat window published nothing -- one of the
+     * SPO2_* codes in ppg.h: 1 R past the curve's domain, 2 the correlation
+     * gate, 3 one channel's AC span too small, 4 DC too low to divide by,
+     * 5 not enough correlation history yet.  Every path out of the SpO2
+     * update sets it, so "sp=0" always comes with a reason.  It describes
+     * the WINDOW, not the reading: a non-zero rail beside a non-zero sp
+     * means that one window gave nothing and the published value is riding
+     * it out until SPO2_STALE_MS retires it.
      */
     f_dec(PSTR("r"),    ((uint32_t)ppg.r_q12 * 1000UL) >> 12);
     f_dec(PSTR("aci"),  ppg.fac_ir);         /* band-passed IR  span -> R */

@@ -40,10 +40,17 @@ typedef struct {
      * channel's AC being wrong, and the raw figures cannot show which. */
     uint16_t fac_ir, fac_red;
     uint16_t r_q12;         /* ratio-of-ratios R in Q12                   */
-    /* 0 = a reading was published; 1 = R outside the calibration curve's
-     * domain; 2 = RED and IR failed the correlation gate, so the pair does
-     * not describe a pulse at all.  The two are very different faults and
-     * the display says which. */
+    /* Why the last completed beat window produced no saturation -- one of
+     * the SPO2_* codes below.  Every path out of spo2_update() sets it, so
+     * "no SpO2" is always an answerable question rather than a blank field:
+     * three of these used to return silently, and a device that will not
+     * measure looked identical whether the red return was dead, the pulse
+     * was too weak or the ratio had simply landed off the curve.
+     *
+     * It describes the LAST WINDOW, not the displayed value: a published
+     * reading survives the odd bad window and is retired by the staleness
+     * timer in ppg_service(), so a non-zero code with spo2_x10 still set
+     * means "this beat gave nothing", not "there is no reading". */
     uint8_t  spo2_rail;
     uint8_t  corr_x100;     /* red/IR Pearson correlation, 0..100          */
     uint8_t  led_ir, led_red;
@@ -62,6 +69,31 @@ typedef struct {
 } ppg_state_t;
 
 extern ppg_state_t ppg;
+
+/* ppg_state_t.spo2_rail -- why the last beat window published nothing.
+ *
+ *   SPO2_OK        a reading was published from that window
+ *   SPO2_R_RANGE   R past the curve's calibrated domain.  Not a low
+ *                  saturation: the channels are reversed, or something
+ *                  non-pulsatile is riding on one of them.  r_q12 is the
+ *                  diagnosis
+ *   SPO2_CORR      RED and IR did not move together, so the pair does not
+ *                  describe a pulse whatever R comes out of it.  Dead or
+ *                  unseen red emitter, movement, ambient light.
+ *                  corr_x100 is the diagnosis
+ *   SPO2_WEAK      one channel's band-passed AC span is too small to form
+ *                  a ratio from.  fac_ir / fac_red say which
+ *   SPO2_DC        DC too low to divide by -- the finger is barely on the
+ *                  sensor, or an emitter is not driven at all
+ *   SPO2_WARMUP    not enough correlation history yet.  Transient, and
+ *                  only ever seen in the first seconds of a measurement
+ */
+#define SPO2_OK        0
+#define SPO2_R_RANGE   1
+#define SPO2_CORR      2
+#define SPO2_WEAK      3
+#define SPO2_DC        4
+#define SPO2_WARMUP    5
 
 void ppg_init(void);
 void ppg_reset_measure(void);       /* clears the running measurement      */

@@ -344,11 +344,32 @@ static void draw_wave(int16_t x0, int16_t y0, int16_t w, int16_t h)
     gfx_vline((int16_t)(x0 + w - 1), y0, h, C_WHITE);
 }
 
-/* value or dashes */
-static void val_or_dash(int16_t x, int16_t y, uint16_t v_x10, uint8_t sc, uint8_t ok)
+/* ------------------------------------------------------------------
+ *  One rounding for the whole device
+ *
+ *  The DSP publishes tenths, and every screen used to convert them its own
+ *  way: the monitor truncated (bpm_x10 / 10), the waveform screen printed a
+ *  tenth through gfx_num_dec(), the trend screen truncated again for its
+ *  label and once more for the point it plotted.  One measurement of 72.8
+ *  bpm therefore read "72" on the monitor, "72.8" on the waveform screen and
+ *  "72" on the trend at the same instant, off the same variable -- three
+ *  pages that looked like three disagreeing measurements.
+ *
+ *  The large seven-segment readout is three digits wide and has no room for
+ *  a decimal point, so the whole device rounds to the nearest whole unit and
+ *  every page shows that one number.  Truncation is not good enough for
+ *  that: it biases every reading down by half a unit, which is exactly the
+ *  "slightly lower" disagreement it was producing.
+ * ------------------------------------------------------------------ */
+static uint16_t whole(uint16_t v_x10) { return (uint16_t)((v_x10 + 5u) / 10u); }
+
+/* Value or dashes, in the same whole units as every other screen.  Returns
+ * the width drawn, so a unit suffix can sit against it however many digits
+ * it turned out to be. */
+static uint8_t val_or_dash(int16_t x, int16_t y, uint16_t v_x10, uint8_t sc, uint8_t ok)
 {
-    if (ok) gfx_num_dec(x, y, v_x10, sc, C_WHITE);
-    else    gfx_text_P(x, y, S_DASH3, sc, C_WHITE);
+    if (ok) return gfx_num(x, y, (int32_t)whole(v_x10), sc, C_WHITE);
+    return gfx_text_P(x, y, S_DASH3, sc, C_WHITE);
 }
 
 /* ======================= screen: monitor ======================= */
@@ -421,7 +442,7 @@ static void scr_monitor(void)
 
     /* --- heart rate, large 7-segment --- */
     if (ppg.bpm_x10 >= 250)
-        gfx_seg_num(2, 19, 16, 24, 4, 3, (uint16_t)(ppg.bpm_x10 / 10), 3, 1, C_WHITE);
+        gfx_seg_num(2, 19, 16, 24, 4, 3, whole(ppg.bpm_x10), 3, 1, C_WHITE);
     else
         gfx_text_P(8, 26, S_DASH3, 2, C_WHITE);
     gfx_text_P(20, 45, PSTR("BPM"), 1, C_WHITE);
@@ -431,7 +452,7 @@ static void scr_monitor(void)
     /* --- SpO2 --- */
     gfx_text_P(64, 18, PSTR("SpO2"), 1, C_WHITE);
     if (ppg.spo2_x10)
-        gfx_seg_num(64, 27, 12, 17, 3, 2, (uint16_t)(ppg.spo2_x10 / 10), 3, 1, C_WHITE);
+        gfx_seg_num(64, 27, 12, 17, 3, 2, whole(ppg.spo2_x10), 3, 1, C_WHITE);
     else
         gfx_text_P(70, 30, S_DASH3, 2, C_WHITE);
     gfx_text_P(107, 36, PSTR("%"), 1, C_WHITE);
@@ -445,20 +466,53 @@ static void scr_monitor(void)
         gfx_text_P(78, 45, S_DASH3, 1, C_WHITE);
     }
 
-    /* --- acquisition progress, the reason for no SpO2, or the live trace --- */
-    if (ppg.spo2_rail) {
-        /* A pulse is being tracked but the ratio-of-ratios is outside the
-         * range the SpO2 curve is calibrated for, so there is no reading to
-         * show.  R itself is the diagnosis, so show it (x1000, the same
-         * scaling as the "r" field on the diagnostic UART): about 1/R of a
-         * plausible value means RED and IR are reversed, while an R that
-         * climbs when the room lights change or the finger shifts is
-         * common-mode interference. */
-        gfx_text_P(2, ROW(5), PSTR("NO SpO2 R"), 1, C_WHITE);
-        gfx_num(56, ROW(5), (int32_t)(((uint32_t)ppg.r_q12 * 1000UL) >> 12),
-                1, C_WHITE);
-        gfx_text_P(88, ROW(5), PSTR("c"), 1, C_WHITE);
-        gfx_num(94, ROW(5), (int32_t)ppg.corr_x100, 1, C_WHITE);
+    /* --- acquisition progress, the reason for no SpO2, or the live trace ---
+     *
+     * The reason line is shown only while there is genuinely no reading to
+     * show.  spo2_rail describes the LAST BEAT WINDOW, and a single bad
+     * window next to a perfectly good published value is normal -- gating
+     * this on the flag alone put "NO SpO2" under a live saturation. */
+    if (!ppg.spo2_x10 && ppg.spo2_rail) {
+        gfx_text_P(2, ROW(5), PSTR("NO SpO2 "), 1, C_WHITE);
+        switch (ppg.spo2_rail) {
+            case SPO2_R_RANGE:
+            case SPO2_CORR:
+                /* A pulse is being tracked, but either the ratio-of-ratios
+                 * is outside the range the SpO2 curve is calibrated for or
+                 * the two channels are not moving together.  R and the
+                 * correlation together say which, and they are the whole
+                 * diagnosis, so show both (R x1000, the same scaling as the
+                 * "r" field on the diagnostic UART).  About 1/R of a
+                 * plausible value with a high correlation means RED and IR
+                 * are reversed; an R that climbs when the room lights change
+                 * or the finger shifts is common-mode interference; a low
+                 * correlation means RED is not seeing the pulse at all.
+                 * README, "NO SpO2", tabulates the combinations. */
+                gfx_text_P(50, ROW(5), PSTR("R"), 1, C_WHITE);
+                gfx_num(56, ROW(5),
+                        (int32_t)(((uint32_t)ppg.r_q12 * 1000UL) >> 12),
+                        1, C_WHITE);
+                gfx_text_P(88, ROW(5), PSTR("c"), 1, C_WHITE);
+                gfx_num(94, ROW(5), (int32_t)ppg.corr_x100, 1, C_WHITE);
+                break;
+            case SPO2_WEAK:
+                /* Not enough band-passed AC in one of the channels to form a
+                 * ratio from.  The two spans say which, and a red span of
+                 * almost nothing beside a healthy IR span is an emitter that
+                 * is not being seen rather than a finger that is not
+                 * perfusing. */
+                gfx_text_P(50, ROW(5), PSTR("ac"), 1, C_WHITE);
+                gfx_num(62, ROW(5), (int32_t)ppg.fac_ir, 1, C_WHITE);
+                gfx_text_P(92, ROW(5), PSTR("/"), 1, C_WHITE);
+                gfx_num(98, ROW(5), (int32_t)ppg.fac_red, 1, C_WHITE);
+                break;
+            case SPO2_DC:
+                gfx_text_P(50, ROW(5), PSTR("LOW DC"), 1, C_WHITE);
+                break;
+            default:                            /* SPO2_WARMUP */
+                gfx_text_P(50, ROW(5), PSTR("WAIT"), 1, C_WHITE);
+                break;
+        }
     } else if (!ppg.valid) {
         gfx_text_P(2, ROW(5), PSTR("ACQ"), 1, C_WHITE);
         gfx_progress(24, 54, 102, 9, ppg.progress);
@@ -470,12 +524,18 @@ static void scr_monitor(void)
 /* ======================= screen: waveform ======================= */
 static void scr_wave(void)
 {
+    int16_t x;
+
     title_bar(S_WAVE);
+    /* Whole units, the same figures the monitor screen shows.  This line
+     * used to print a tenth, so switching between the two pages during one
+     * measurement showed two different heart rates. */
     gfx_text_P(2, ROW(0), PSTR("HR"), 1, C_WHITE);
     val_or_dash(18, ROW(0), ppg.bpm_x10, 1, ppg.bpm_x10 >= 250);
     gfx_text_P(56, ROW(0), PSTR("SpO2"), 1, C_WHITE);
-    val_or_dash(86, ROW(0), ppg.spo2_x10, 1, ppg.spo2_x10 != 0);
-    gfx_text_P(116, ROW(0), PSTR("%"), 1, C_WHITE);
+    x = 86;
+    x += val_or_dash(x, ROW(0), ppg.spo2_x10, 1, ppg.spo2_x10 != 0);
+    gfx_text_P((int16_t)(x + 1), ROW(0), PSTR("%"), 1, C_WHITE);
     gfx_hline(0, 26, 128, C_WHITE);
     draw_wave(0, 28, 128, 36);
 }
@@ -523,7 +583,7 @@ static void plot_trend(const uint8_t *buf, int16_t y0, int16_t h,
     /* label plate on the left so it stays readable over the trace */
     gfx_fill(0, (int16_t)(y0 + 2), 46, 9, C_BLACK);
     gfx_text_P(1, (int16_t)(y0 + 3), label, 1, C_WHITE);
-    if (cur_x10) gfx_num(26, (int16_t)(y0 + 3), cur_x10 / 10, 1, C_WHITE);
+    if (cur_x10) gfx_num(26, (int16_t)(y0 + 3), whole(cur_x10), 1, C_WHITE);
     else         gfx_text_P(26, (int16_t)(y0 + 3), S_DASH3, 1, C_WHITE);
 }
 
@@ -551,13 +611,17 @@ static void scr_stats(void)
     gfx_num(100, ROW(0), (int32_t)ppg.beats, 1, C_WHITE);
 
     row_label(ROW(1), PSTR("HR m/a/M"));
-    gfx_num(52, ROW(1), ppg.bpm_min_x10 / 10, 1, C_WHITE);
-    gfx_num(76, ROW(1), ppg.bpm_avg_x10 / 10, 1, C_WHITE);
-    gfx_num(100, ROW(1), ppg.bpm_max_x10 / 10, 1, C_WHITE);
+    gfx_num(52, ROW(1), whole(ppg.bpm_min_x10), 1, C_WHITE);
+    gfx_num(76, ROW(1), whole(ppg.bpm_avg_x10), 1, C_WHITE);
+    gfx_num(100, ROW(1), whole(ppg.bpm_max_x10), 1, C_WHITE);
 
     row_label(ROW(2), PSTR("SPO2 min"));
-    val_or_dash(64, ROW(2), ppg.spo2_min_x10, 1, ppg.spo2_min_x10 != 0);
-    gfx_text_P(94, ROW(2), PSTR("%"), 1, C_WHITE);
+    {   /* against the value, which is now two or three digits wide rather
+         * than the fixed four a printed tenth always occupied */
+        int16_t x = 64;
+        x += val_or_dash(x, ROW(2), ppg.spo2_min_x10, 1, ppg.spo2_min_x10 != 0);
+        gfx_text_P((int16_t)(x + 1), ROW(2), PSTR("%"), 1, C_WHITE);
+    }
 
     row_label(ROW(3), PSTR("SDNN"));
     gfx_num(52, ROW(3), ppg.sdnn_ms, 1, C_WHITE);
@@ -1008,9 +1072,12 @@ void ui_tick(void)
 
     if ((uint32_t)(now - tr_ms) >= 2000) {
         tr_ms = now;
+        /* Sampled with the same rounding the labels use, so the point
+         * plotted and the figure printed beside it cannot disagree. */
         tr_bpm[tr_head]  = (uint8_t)(ppg.valid && ppg.bpm_x10 >= 250
-                                     ? (ppg.bpm_x10 / 10 > 250 ? 250 : ppg.bpm_x10 / 10) : 0);
-        tr_spo2[tr_head] = (uint8_t)(ppg.valid && ppg.spo2_x10 ? ppg.spo2_x10 / 10 : 0);
+                                     ? (whole(ppg.bpm_x10) > 250 ? 250
+                                                                 : whole(ppg.bpm_x10)) : 0);
+        tr_spo2[tr_head] = (uint8_t)(ppg.valid && ppg.spo2_x10 ? whole(ppg.spo2_x10) : 0);
         tr_head = (uint8_t)((tr_head + 1) % TREND_LEN);
     }
 

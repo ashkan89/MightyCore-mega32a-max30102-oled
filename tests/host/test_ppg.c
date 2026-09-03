@@ -563,6 +563,113 @@ static void test_hr_without_spo2(void)
     CHECK(ppg.spo2_x10 == 0,
           "SpO2 %u published from an uncorrelated red channel",
           ppg.spo2_x10);
+    /* And it has to SAY so.  A red channel that is not tracking the pulse
+     * is the single most common reason this device declines to measure,
+     * and the code that says which reason it was is the only thing that
+     * tells it apart from a firmware that is simply broken. */
+    CHECK(ppg.spo2_rail == SPO2_CORR,
+          "rail=%u on an uncorrelated red channel, want SPO2_CORR=%u",
+          ppg.spo2_rail, SPO2_CORR);
+}
+
+/* Every way out of the SpO2 update has to leave a reason behind.  Three of
+ * them used to return silently, so "no SpO2" covered a dead red emitter, a
+ * pulse too weak to form a ratio from and a finger barely on the sensor
+ * with the same blank field -- three different faults, three different
+ * fixes, and no way to tell them apart on the device. */
+static void test_spo2_reason_is_always_given(void)
+{
+    sim_t p;
+    banner("no SpO2 always comes with a reason");
+
+    /* --- a flat red channel: no AC to form a ratio from --- */
+    p.bpm = 72.0;
+    p.dc_ir = 90000; p.dc_red = 65000;
+    p.ac_ir = 900;   p.ac_red = 0;
+    p.noise = 0;     p.fs = 100;
+
+    sim_init();
+    {
+        sim_t idle = p;
+        idle.dc_ir = 2000; idle.dc_red = 1500;
+        idle.ac_ir = 0;
+        sim_run(&idle, 1500);
+    }
+    sim_run(&p, 20000);
+    CHECK(ppg.bpm_x10 > 600 && ppg.bpm_x10 < 900,
+          "flat red: heart rate %u not tracked (want ~720)", ppg.bpm_x10);
+    CHECK(ppg.spo2_x10 == 0, "flat red: SpO2 %u published", ppg.spo2_x10);
+    CHECK(ppg.spo2_rail == SPO2_WEAK,
+          "flat red: rail=%u, want SPO2_WEAK=%u", ppg.spo2_rail, SPO2_WEAK);
+    /* The perfusion index belongs to the IR channel and must survive a
+     * useless red one -- it used to be computed after the red AC test and
+     * so was blanked along with the saturation. */
+    CHECK(ppg.pi_x100 > 0,
+          "flat red: perfusion index blanked by an unusable red channel");
+    /* And the two spans have to say WHICH channel is short. */
+    CHECK(ppg.fac_ir > 0 && ppg.fac_red < ppg.fac_ir / 4,
+          "flat red: AC spans ir=%u red=%u do not identify the weak channel",
+          ppg.fac_ir, ppg.fac_red);
+
+    /* --- reversed channels: R arrives as 1/R, off the curve's domain --- */
+    p.ac_ir = 400; p.ac_red = 1200;      /* red AC/DC far above IR's */
+    sim_init();
+    {
+        sim_t idle = p;
+        idle.dc_ir = 2000; idle.dc_red = 1500;
+        idle.ac_ir = 0;    idle.ac_red = 0;
+        sim_run(&idle, 1500);
+    }
+    sim_run(&p, 20000);
+    CHECK(ppg.spo2_x10 == 0,
+          "R=%.2f: SpO2 %u published from a ratio off the curve",
+          ppg.r_q12 / 4096.0, ppg.spo2_x10);
+    CHECK(ppg.spo2_rail == SPO2_R_RANGE,
+          "reversed pair: rail=%u, want SPO2_R_RANGE=%u",
+          ppg.spo2_rail, SPO2_R_RANGE);
+}
+
+/* The regression test for the correlation window.
+ *
+ * A real pulse on a weak red return -- a dark or thick finger, a module
+ * whose red emitter couples poorly -- correlates well when measured over
+ * several cardiac cycles, as the reference measures it, and erratically
+ * when measured over one.  With the sums restarted every beat this signal
+ * spent most of a measurement dashed out at rail=SPO2_CORR, reporting that
+ * red was not tracking the pulse while red was tracking it perfectly. */
+static void test_spo2_weak_red_still_measures(void)
+{
+    sim_t p;
+    double R, want, got;
+    banner("SpO2 survives a weak red return");
+
+    p.bpm = 72.0;
+    p.dc_ir = 120000; p.dc_red = 14000;   /* red returns a tenth of IR */
+    p.ac_ir = 1200;   p.ac_red = 77.0;    /* R about 0.55 all the same */
+    p.noise = 40;     p.fs = 100;
+
+    R    = (p.ac_red / p.dc_red) / (p.ac_ir / p.dc_ir);
+    want = -45.06 * R * R + 30.354 * R + 94.845;
+
+    sim_init();
+    {
+        sim_t idle = p;
+        idle.dc_ir = 2000; idle.dc_red = 1500;
+        idle.ac_ir = 0;    idle.ac_red = 0;
+        sim_run(&idle, 1500);
+    }
+    sim_run(&p, 30000);
+
+    CHECK(ppg.spo2_x10 != 0,
+          "weak red (R=%.3f): no SpO2 (rail=%u corr=%u acr=%u)",
+          R, ppg.spo2_rail, ppg.corr_x100, ppg.fac_red);
+    if (!ppg.spo2_x10) return;
+    got = ppg.spo2_x10 / 10.0;
+    CHECK(fabs(got - want) < 4.0,
+          "weak red: SpO2 %.1f want %.1f (measured R=%.3f, true %.3f)",
+          got, want, ppg.r_q12 / 4096.0, R);
+    CHECK(ppg.spo2_rail == SPO2_OK,
+          "weak red: rail=%u with a reading published", ppg.spo2_rail);
 }
 
 static void test_spo2_goes_stale(void)
@@ -878,6 +985,8 @@ int main(void)
     test_no_finger();
     test_finger_release();
     test_hr_without_spo2();
+    test_spo2_reason_is_always_given();
+    test_spo2_weak_red_still_measures();
     test_spo2_goes_stale();
     test_millis_wraparound();
     test_sample_counter_wraparound();

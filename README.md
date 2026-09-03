@@ -267,7 +267,7 @@ you get instead:
 | `ACQUIRING` + progress | a pulse is being tracked, fewer than 4 accepted beats |
 | `READY` | the pulse rate has converged |
 | `---` in place of a value | that particular metric has no valid measurement |
-| `NO SpO2  R nnn  c nn` | a pulse is tracked but *R* is outside the curve's domain, or red and IR are not moving together. The two numbers say which |
+| `NO SpO2  ...` | a pulse is tracked but no saturation could be formed from it. The rest of the line says why — see ["NO SpO2"](#no-spo2) |
 | `NO DATA FROM SENSOR` | the part answers on the bus but is not converting |
 | `SENSOR FAULT` | it does not answer at all — see [Troubleshooting](#4-troubleshooting-sensor-fault) |
 | quality bars, `Q nn` | signal-quality index for the current measurement |
@@ -357,10 +357,23 @@ driver's own verdict:
 - `CFG BAD: not set up` — the writes are not landing. That is a **bus**
   problem; the `TW`/`E`/`S` counters on the same screen say how it is failing.
 
-### "NO SpO2  R nnnn  c nn"
+### "NO SpO2"
 
-A pulse is being tracked but no saturation is published. The two numbers say
-why. `R` is the ratio-of-ratios ×1000; `c` is the red/IR correlation ×100.
+A pulse is being tracked but no saturation is published. The line always says
+why — there are five reasons and each prints its own evidence:
+
+| Line | Reason | What to do |
+|---|---|---|
+| `NO SpO2  R nnnn  c nn` | a ratio was formed but it is off the calibrated curve, or the two channels are not moving together | the table below |
+| `NO SpO2  ac nnn/nnn` | one channel's band-passed AC span is too small to form a ratio from. The two numbers are the IR and red spans | a red span near zero beside a healthy IR span is an emitter that is not being seen — run `env:probe`. Both small is a finger that is not perfusing: warm it, press a little firmer |
+| `NO SpO2  LOW DC` | the DC level is too low to divide by | the finger is barely on the sensor, or an emitter is not driven at all |
+| `NO SpO2  WAIT` | not enough correlation history yet | transient, only in the first seconds of a measurement |
+
+The same five reasons appear as `rail=1..5` on the diagnostic UART, and they
+are the `SPO2_*` codes in [src/ppg.h](src/ppg.h).
+
+For the first of those, `R` is the ratio-of-ratios ×1000 and `c` is the red/IR
+correlation ×100:
 
 | `R` | `c` | Diagnosis |
 |---|---|---|
@@ -685,7 +698,7 @@ that can flash the board can already read this.
 | `r` | ratio-of-ratios ×1000 | 400–800 |
 | `aci` `acr` | band-passed AC spans forming *R* | |
 | `corr` | red/IR Pearson correlation ×100 | ≥ 95 |
-| `rail` | 0 published · 1 *R* out of domain · 2 correlation gate | 0 |
+| `rail` | why the last window gave nothing: 0 published · 1 *R* out of domain · 2 correlation gate · 3 AC span too small · 4 DC too low · 5 warming up. Describes the **window**, not the reading — a non-zero `rail` beside a non-zero `sp` is one bad window being ridden out | 0 |
 | `swap` | channel order in use, from the probe | 0 |
 | `err` `stk` `tw` `stg` `ln` | I²C error count, bus force-frees, last status, stage, line levels | 0, 0, —, —, 3 |
 | `ovf` | `OVF_COUNTER` as read, before cross-checking | 0 |
@@ -1040,6 +1053,7 @@ and after — see [Capturing data](#8-capturing-data).
 | `SPO2_STALE_MS` | how long a published SpO₂ survives without a fresh ratio |
 | `R_TRUST_MAX` | top of the SpO₂ curve's domain (295 ⇒ R = 1.152 ⇒ 70 %) |
 | `CORR_MIN_N`/`CORR_MIN_D` | the channel-agreement gate, as a fraction (4/5 = the reference's 0.8) |
+| `RMS_N_MAX` | how many samples the red/IR correlation is averaged over before the sums are halved — the sliding window the 0.8 threshold is judged on. Shorten it and the gate starts flickering on a real pulse; the bound `RMS_N_MAX × RMS_Q_MAX² ≤ 2³¹` is asserted by the host tests |
 | `FINGER_MIN_RISE`, `FINGER_FLOOR_IR`, `FINGER_CAP_IR` | finger detection. `FINGER_CAP_IR` is a **cap**, not a floor — see the long note in the source |
 | `RESP_WIN` | respiration window (3 000 samples; the first reading takes that long) |
 | `LED_PA_MAX` in [src/max30102.h](src/max30102.h) | AGC ceiling. Raising it past 12.6 mA browns out most breakouts |
@@ -1054,9 +1068,10 @@ and after — see [Capturing data](#8-capturing-data).
   single-point offset that cannot correct its shape at low saturation.
 - **Respiration is experimental** and reports nothing more often than it reports
   a number.
-- The **`probe` build has 910 B of flash headroom** and the default build
-  1 660 B. There is not room for both the channel probe and the verbose status
-  line, which is why they are separate environments.
+- The **`probe` build has 552 B of flash headroom** and the default build
+  1 198 B (`release` 3 158 B, `csv` 1 864 B). There is not room for both the
+  channel probe and the verbose status line, which is why they are separate
+  environments.
 - **`OVF_COUNTER` behaviour on this hardware is unresolved** — the datasheet and
   an earlier bench observation disagree. The cross-check handles both, and the
   `ovf` field reports which world this board is in, but it has not been
@@ -1101,6 +1116,50 @@ and after — see [Capturing data](#8-capturing-data).
 ---
 
 ## 17. Changelog
+
+### 1.1.1
+
+**Measurement**
+
+- The red/IR correlation gate is judged over a **sliding multi-beat window**
+  instead of being restarted at every beat. The reference computes its
+  correlation over a four-second buffer and sets 0.8 as the bar for an
+  estimate that well averaged; applying that threshold to a single cardiac
+  cycle made it flicker, so a real pulse on a weak red return spent most of a
+  measurement dashed out at `rail=2` — reporting that red was not tracking the
+  pulse while red was tracking it perfectly. The sums are halved at
+  `RMS_N_MAX` rather than cleared, which gives an exponentially weighted 2–4 s
+  window with no cold start and leaves the overflow bound unchanged. Measured
+  against the previous behaviour on synthetic signals this is better in both
+  directions at once: more readings published from a real pulse (a weak red
+  return goes from 33 of 46 beats to 42; a 0.1 % perfusion index from nothing
+  at all to a reading) and fewer published from a red channel carrying only
+  noise (four false readings to none).
+- **Every** way out of the SpO₂ update now leaves a reason behind. Three of
+  them returned silently, so a dead red emitter, a pulse too weak to form a
+  ratio from and a finger barely on the sensor all showed the same blank
+  field. `spo2_rail` has five codes (`SPO2_*` in [src/ppg.h](src/ppg.h)), the
+  MONITOR screen prints the evidence for each, and `rail` on the UART carries
+  the same value.
+- The perfusion index and both AC spans are published before the SpO₂ gates
+  rather than after. They are IR-channel and raw-signal properties, and a weak
+  red return used to blank them along with the saturation — removing exactly
+  the numbers that say how good the signal is at the moment they are wanted.
+- `NO SpO2` is shown only when there is genuinely no reading. `spo2_rail`
+  describes the last window, and one bad window beside a good published value
+  is normal, so gating the line on the flag alone put `NO SpO2` under a live
+  saturation.
+
+**Display**
+
+- Every screen shows the **same** heart rate and saturation. Each converted the
+  published tenths its own way — MONITOR truncated, WAVEFORM printed a tenth,
+  TRENDS truncated for its label and again for the point it plotted — so one
+  measurement of 72.8 bpm read `72`, `72.8` and `72` on three pages at the same
+  instant, off the same variable. The whole device now rounds to the nearest
+  whole unit through one helper, which is also what the three-digit
+  seven-segment readout can display; truncation had been biasing every reading
+  down by half a unit.
 
 ### 1.1.0
 

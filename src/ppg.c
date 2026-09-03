@@ -77,11 +77,17 @@ uint8_t ppg_wave_head;
 #define R_HIST          8
 #define LOCK_BEATS      4       /* beats before a reading is published      */
 /* A published SpO2 goes stale if no beat window produces a usable ratio
- * for this long.  spo2_update() has several legitimate early returns (AC
- * too small, correlation gate, window too short) and none of them used to
+ * for this long.  spo2_update() has several legitimate ways out (AC too
+ * small, correlation gate, not enough history) and none of them used to
  * clear the last value, so a reading taken from one good beat stayed on
  * the display indefinitely as long as beats kept arriving -- presented as
- * current when nothing was measuring it any more. */
+ * current when nothing was measuring it any more.
+ *
+ * They still do not clear it, deliberately: a single bad window is normal
+ * and blanking the display on each one would make a good measurement
+ * flicker.  What they set instead is spo2_rail, so the reason is visible
+ * while the value rides out the gap, and this timer is what finally
+ * retires a value nothing has confirmed. */
 #define SPO2_STALE_MS 6000UL
 
 /* Largest R the SpO2 curve is still calibrated for, in Q8.  295/256 = 1.152,
@@ -118,12 +124,40 @@ uint8_t ppg_wave_head;
  *
  * Both need only Sx2, Sy2 and Sxy, so the correlation is free once the RMS
  * is being accumulated:  r = Sxy / sqrt(Sx2 * Sy2).
+ *
+ * The window those three sums span is NOT one beat, and that matters more
+ * than the threshold does.  The reference forms its correlation over a
+ * four-second buffer -- four or five cardiac cycles -- and 0.8 is the bar
+ * it sets for an estimate that well averaged.  Restarting the sums at every
+ * beat, as this did, applies the reference's threshold to an estimate made
+ * from a single cycle, where noise moves it by tens of points: a real pulse
+ * on a weak red return measured 0.84 one beat and 0.6 the next, so the gate
+ * flickered and SpO2 spent most of a measurement dashed out with rail=2 --
+ * "red is not tracking the pulse" -- while red was tracking it perfectly.
+ * The one-beat estimate is also short enough that the weak channel's RMS
+ * could quantise to zero outright, which returned with no reading and no
+ * reason at all.
+ *
+ * So the sums slide instead: they are halved when the count reaches
+ * RMS_N_MAX, which leaves an exponentially weighted window of roughly
+ * RMS_N_MAX/2 .. RMS_N_MAX samples -- 2 to 4 s at this board's rate, the
+ * reference's window, arrived at without buffering a single sample.  The
+ * halving is also what keeps the bound below unchanged: the sums can never
+ * exceed RMS_N_MAX * RMS_Q_MAX^2 either way, which is what the overflow
+ * check in tests/host/test_ppg.c asserts.
+ *
+ * Measured against the shipped per-beat window on synthetic signals, this
+ * is better in both directions at once -- it publishes more readings from a
+ * real pulse (a weak red return goes from 33 of 46 beats to 42, a 0.1 %
+ * perfusion index from none at all to a reading) and it publishes fewer
+ * from a red channel carrying only noise (four false readings to none).
  */
 #define RMS_SHIFT       3       /* keeps the sums of squares inside a uint32 */
 #define RMS_Q_MAX    2047       /* per-sample clamp in the shifted domain    */
-#define RMS_N_MAX     512       /* and a cap on the window, for the same     */
+#define RMS_N_MAX     512       /* halve the sums here: the sliding window   */
 #define CORR_MIN_N      4       /* 0.8 as a fraction: correlation >= 4/5     */
 #define CORR_MIN_D      5
+#define CORR_MIN_SAMP  16       /* history needed before the gate is judged  */
 
 /* Respiration (RIIV): the breathing cycle rides on the IR baseline.  A
  * 2-pole low-pass at 0.25 Hz removes the cardiac component, a slow
@@ -201,8 +235,11 @@ typedef struct {
     uint32_t rir_min, rir_max;      /* raw IR       -> PI          */
     uint32_t rred_min, rred_max;    /* raw RED      -> diagnostics */
     uint8_t  win_valid;
-    /* RMS and cross-product accumulators for the window above.  Sx2/Sy2 give
-     * each channel's AC; Sxy with them gives the red/IR correlation. */
+    /* RMS and cross-product accumulators for the red/IR correlation.  Sx2
+     * and Sy2 give each channel's RMS, Sxy with them gives the Pearson
+     * correlation.  These deliberately do NOT belong to the per-beat window
+     * above: they slide across several beats and are halved at RMS_N_MAX --
+     * see the long note there for why one beat is far too short. */
     uint32_t ssq_ir, ssq_red;
     int32_t  sxy;
     uint16_t ssq_n;
@@ -273,6 +310,12 @@ void ppg_reset_measure(void)
     s.cyc_max = s.cyc_min = 0;
     s.amp_avg = 0;
     s.win_valid = 0;
+    /* The correlation sums outlive the per-beat window now, so clearing
+     * win_valid no longer clears them -- a new measurement would otherwise
+     * be judged on the previous finger's red/IR agreement. */
+    s.ssq_ir = s.ssq_red = 0;
+    s.sxy    = 0;
+    s.ssq_n  = 0;
     s.ibi_n = s.ibi_i = 0;
     s.r_n = s.r_i = 0;
     s.t_cross_q8 = 0;
@@ -295,7 +338,7 @@ void ppg_reset_measure(void)
     ppg.resp_bpm  = 0;
     ppg.sqi       = 0;
     ppg.wave      = 0;
-    ppg.spo2_rail = 0;
+    ppg.spo2_rail = SPO2_OK;
     ppg.corr_x100 = 0;
     ppg.fac_ir    = 0;
     ppg.fac_red   = 0;
@@ -397,26 +440,56 @@ static void spo2_update(void)
     raci = s.rir_max  - s.rir_min;                  /* raw, drives PI        */
     racr = s.rred_max - s.rred_min;                 /* raw, diagnostics only */
 
-    if (aci < 20 || acr < 5) return;
-    if (ppg.dc_ir < 2000 || ppg.dc_red < 2000) return;
     if (aci  > 60000UL) aci  = 60000UL;
     if (acr  > 60000UL) acr  = 60000UL;
     if (raci > 60000UL) raci = 60000UL;
     if (racr > 60000UL) racr = 60000UL;
 
+    /* Published before any SpO2 gate, because none of these are SpO2.
+     * The AC spans and the perfusion index are properties of the IR
+     * channel and of the raw signal, and they used to be computed after
+     * the "is there enough red to form a ratio" test -- so a weak red
+     * return blanked the perfusion index and both AC figures as well,
+     * removing exactly the numbers that say how good the signal is at
+     * the moment they are most wanted.  fac_* likewise: they are what
+     * identifies WHICH channel is short, so they cannot wait until a
+     * window has already passed the test. */
     ppg.ac_ir   = (uint16_t)raci;
     ppg.ac_red  = (uint16_t)racr;
-    ppg.pi_x100 = (uint16_t)((raci * 10000UL) / ppg.dc_ir);
+    ppg.fac_ir  = (uint16_t)aci;
+    ppg.fac_red = (uint16_t)acr;
+    if (ppg.dc_ir >= 2000)
+        ppg.pi_x100 = (uint16_t)((raci * 10000UL) / ppg.dc_ir);
+
+    if (ppg.dc_ir < 2000 || ppg.dc_red < 2000) {
+        ppg.spo2_rail = SPO2_DC;
+        return;
+    }
+    if (aci < 20 || acr < 5) {
+        ppg.spo2_rail = SPO2_WEAK;
+        return;
+    }
 
     /* --- red/IR agreement gate, from the reference --- */
-    if (s.ssq_n < 16) return;                       /* too short to judge */
+    if (s.ssq_n < CORR_MIN_SAMP) {                  /* too short to judge */
+        ppg.spo2_rail = SPO2_WARMUP;
+        return;
+    }
     {
         uint32_t rq_i = isqrt32(s.ssq_ir  / s.ssq_n);   /* RMS, shifted domain */
         uint32_t rq_r = isqrt32(s.ssq_red / s.ssq_n);
         int32_t  cx   = s.sxy / (int32_t)s.ssq_n;       /* mean cross product  */
         uint32_t den;
 
-        if (rq_i == 0 || rq_r == 0) return;
+        /* A channel whose RMS has quantised away entirely.  With the
+         * sliding window this needs a genuinely flat channel rather than
+         * merely a weak one, but it still has to be reported: returning
+         * silently is what made an undriven emitter look like a device
+         * that simply would not measure. */
+        if (rq_i == 0 || rq_r == 0) {
+            ppg.spo2_rail = SPO2_WEAK;
+            return;
+        }
         den = rq_i * rq_r;
 
         /* Pearson r = Sxy / sqrt(Sx2*Sy2) = cx / (rms_i*rms_r).  Compared as
@@ -426,7 +499,11 @@ static void spo2_update(void)
          *
          * Only the RATIO of these sums is used, never their absolute size,
          * which is why the coarse RMS_SHIFT quantisation is harmless here --
-         * it scales numerator and denominator alike. */
+         * it scales numerator and denominator alike.
+         *
+         * The sums span several beats (see RMS_N_MAX), so this is the
+         * reference's multi-cycle correlation rather than a single beat's,
+         * which is what makes a 0.8 threshold on it meaningful. */
         ppg.corr_x100 = (uint8_t)((cx <= 0) ? 0
                         : ((uint32_t)cx >= den) ? 100
                         : (uint8_t)(((uint32_t)cx * 100UL) / den));
@@ -434,24 +511,27 @@ static void spo2_update(void)
             /* RED and IR are not moving together, so whatever R comes out of
              * them is not a measurement of blood.  The reference returns
              * -999 here; we publish nothing and say why. */
-            ppg.spo2_rail = 2;
+            ppg.spo2_rail = SPO2_CORR;
             ppg.spo2_x10  = 0;
             return;
         }
     }
-    /* The AC that forms R stays peak-to-peak, NOT the reference's RMS.
-     * The reference works in float over a four-second window, where the
-     * choice costs nothing; here the window is one beat and the arithmetic
-     * is integer, and an RMS taken from these shifted accumulators was
-     * measured at up to 7 % error on R against under 1.6 % for the span --
-     * quantisation of the weaker RED channel, which is exactly the channel
-     * that must not be degraded.  RMS was adopted upstream to stop noise
-     * inflating the span; the correlation gate above rejects those signals
-     * outright, which addresses the same problem without the precision
-     * cost. */
-    ppg.fac_ir  = (uint16_t)aci;
-    ppg.fac_red = (uint16_t)acr;
-
+    /* The AC that forms R stays peak-to-peak, NOT the reference's RMS, and
+     * it is taken over ONE BEAT where the correlation above spans several.
+     * The two want different things: the correlation is a statistic and
+     * gets better the longer it is averaged, while R has to describe the
+     * cardiac cycle in front of it, and a ratio smeared over four seconds
+     * of drifting contact is not that.
+     *
+     * Peak-to-peak rather than RMS for the same reason.  The reference
+     * works in float over its whole window, where the choice costs
+     * nothing; an RMS taken from these shifted accumulators over a single
+     * beat was measured at up to 7 % error on R against under 1.6 % for
+     * the span -- quantisation of the weaker RED channel, which is exactly
+     * the channel that must not be degraded.  RMS was adopted upstream to
+     * stop noise inflating the span; the correlation gate rejects those
+     * signals outright, which addresses the same problem without the
+     * precision cost. */
     ri = (aci << 16) / ppg.dc_ir;                   /* AC/DC in Q16 */
     rr = (acr << 16) / ppg.dc_red;
     if (ri < 1) ri = 1;
@@ -486,11 +566,11 @@ static void spo2_update(void)
          * firmware actively asserted a reading it had no basis for.  Report
          * nothing instead, and raise a flag saying why. */
         if (r8 > R_TRUST_MAX) {
-            ppg.spo2_rail = 1;
+            ppg.spo2_rail = SPO2_R_RANGE;
             ppg.spo2_x10  = 0;
             return;
         }
-        ppg.spo2_rail = 0;
+        ppg.spo2_rail = SPO2_OK;
         if (r8 < 0)   r8 = 0;
         /* SpO2 = -45.06*R^2 + 30.354*R + 94.845, evaluated in Q8.
          *
@@ -798,9 +878,6 @@ void ppg_process(uint32_t red, uint32_t ir)
         s.fred_min = s.fred_max = fr;
         s.rir_min  = s.rir_max  = ir;
         s.rred_min = s.rred_max = red;
-        s.ssq_ir = s.ssq_red = 0;
-        s.sxy    = 0;
-        s.ssq_n  = 0;
         s.win_valid = 1;
     } else {
         if (f  > s.fir_max)  s.fir_max  = f;
@@ -813,11 +890,30 @@ void ppg_process(uint32_t red, uint32_t ir)
         if (red < s.rred_min) s.rred_min = red;
     }
 
-    /* Sums of squares and the cross product, over the same window.  Both
-     * channels are shifted and clamped identically, so the scaling cancels
-     * in the ratio and in the correlation; the cap on the window keeps the
-     * worst case inside a uint32 (2047^2 * 512 = 2.1e9). */
-    if (s.ssq_n < RMS_N_MAX) {
+    /* Sums of squares and the cross product for the red/IR correlation.
+     * Both channels are shifted and clamped identically, so the scaling
+     * cancels in the correlation.
+     *
+     * This window is NOT the per-beat one above: it slides across several
+     * beats, halved when the count reaches RMS_N_MAX, which is what makes
+     * the reference's 0.8 threshold apply to the kind of multi-cycle
+     * estimate the reference computes it from -- see the note above
+     * RMS_N_MAX.  Halving rather than clearing keeps the estimate warm
+     * across the boundary: a hard restart would put a 16-sample estimate
+     * back under the gate every few seconds, which is the same flicker in
+     * slower motion.
+     *
+     * The bound is unchanged by the halving, and this is why: the sums are
+     * at most halved-then-refilled, so they stay under
+     * RMS_N_MAX * RMS_Q_MAX^2 = 2047^2 * 512 = 2.1e9 -- inside a uint32
+     * for the squares and inside an int32 for the cross product. */
+    if (s.ssq_n >= RMS_N_MAX) {
+        s.ssq_ir  >>= 1;
+        s.ssq_red >>= 1;
+        s.sxy     >>= 1;
+        s.ssq_n   >>= 1;
+    }
+    {
         int32_t qi = f  >> RMS_SHIFT;
         int32_t qr = fr >> RMS_SHIFT;
         if (qi >  RMS_Q_MAX) qi =  RMS_Q_MAX;
